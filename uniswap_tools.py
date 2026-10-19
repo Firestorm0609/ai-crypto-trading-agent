@@ -117,72 +117,19 @@ def get_uniswap_pool(pair: str) -> str:
 
 
 def get_swap_quote(token_in: str, token_out: str, amount: float = 1.0) -> str:
-    """Get a swap quote from Uniswap."""
-    token_in = token_in.upper()
-    token_out = token_out.upper()
-
-    in_info = UNISWAP_TOKENS.get(token_in)
-    out_info = UNISWAP_TOKENS.get(token_out)
-
-    if not in_info or not out_info:
-        return f"Token not found. Available: {', '.join(UNISWAP_TOKENS.keys())}"
-
-    # Try Uniswap API with key
-    if UNISWAP_API_KEY:
-        try:
-            amount_wei = int(amount * (10 ** in_info["decimals"]))
-            url = f"https://api.uniswap.org/v1/quote?tokenIn={in_info['address']}&tokenOut={out_info['address']}&amount={amount_wei}&type=EXACT_INPUT&chain=1"
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "TradingAgent/1.0",
-                "Authorization": f"Bearer {UNISWAP_API_KEY}",
-                "x-api-key": UNISWAP_API_KEY,
-            })
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-
-            amount_out = int(data.get("quote", {}).get("amountOut", 0)) / (10 ** out_info["decimals"])
-            gas_estimate = float(data.get("gasEstimate", 0)) / 1e18 * 2500  # ETH price
-
-            if amount_out > 0:
-                value_in = amount * _get_price(token_in)
-                value_out = amount_out * _get_price(token_out)
-
-                return (
-                    f"Uniswap Swap Quote\n\n"
-                    f"Sell: {amount:.4f} {token_in} (${value_in:,.2f})\n"
-                    f"Buy: {amount_out:.4f} {token_out} (${value_out:,.2f})\n\n"
-                    f"Rate: 1 {token_in} = {amount_out/amount:.6f} {token_out}\n"
-                    f"Fee: 0.3%\n"
-                    f"Est. Gas: ${gas_estimate:.2f}\n\n"
-                    f"To swap: app.uniswap.org"
-                )
-        except Exception:
-            pass
-
-    # Fallback: calculate from prices
-    price_in = _get_price(token_in)
-    price_out = _get_price(token_out)
-
-    # Use hardcoded stablecoin prices as fallback
-    if price_out <= 0 and token_out in ("USDC", "USDT", "DAI"):
-        price_out = 1.0
-    if price_in <= 0 and token_in in ("USDC", "USDT", "DAI"):
-        price_in = 1.0
-
-    if price_in <= 0 or price_out <= 0:
-        return f"Could not get prices for {token_in} or {token_out}"
-
-    value_in = amount * price_in
-    amount_out = value_in / price_out
-
-    return (
-        f"Uniswap Swap Quote\n\n"
-        f"Sell: {amount:.4f} {token_in} (${value_in:,.2f})\n"
-        f"Buy: {amount_out:.4f} {token_out} (${amount_out:,.2f})\n\n"
-        f"Rate: 1 {token_in} = {amount_out/amount:.6f} {token_out}\n"
-        f"Fee: 0.3%\n"
-        f"To swap: app.uniswap.org"
-    )
+    """Get a REAL swap quote from the Uniswap V3 QuoterV2 contract (Ethereum)."""
+    try:
+        from evm_swap import real_swap_quote
+        result = real_swap_quote("ethereum", token_in, token_out, float(amount))
+        if result.startswith("❌") and "pool" in result.lower():
+            # Try Base, then Robinhood Chain — some pairs are only there
+            for alt in ("base", "robinhood"):
+                alt_result = real_swap_quote(alt, token_in, token_out, float(amount))
+                if not alt_result.startswith("❌"):
+                    return f"(on {alt})\n" + alt_result
+        return result
+    except Exception as e:
+        return f"❌ Quote failed: {e}"
 
 
 def _get_price(token: str) -> float:

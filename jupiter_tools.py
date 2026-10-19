@@ -59,13 +59,15 @@ def _get_sol_token_name(mint: str) -> dict:
         return {"name": data.get("name", "?"), "symbol": data.get("symbol", "?")}
     except Exception:
         pass
-    # Try Jupiter token list
+    # Try Jupiter token search (single-mint GET endpoint was retired)
     try:
-        url = f"https://api.jup.ag/tokens/v1/{mint}"
+        url = f"https://lite-api.jup.ag/tokens/v2/search?query={mint}"
         req = urllib.request.Request(url, headers={"User-Agent": "TradingAgent/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        return {"name": data.get("name", "?"), "symbol": data.get("symbol", "?")}
+            results = json.loads(resp.read().decode())
+        if isinstance(results, list) and results:
+            data = results[0]
+            return {"name": data.get("name", "?"), "symbol": data.get("symbol", "?")}
     except Exception:
         pass
     return {"name": "?", "symbol": "?"}

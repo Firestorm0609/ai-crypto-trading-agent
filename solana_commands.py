@@ -10,9 +10,29 @@ logger = logging.getLogger(__name__)
 
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show wallet info and balances."""
-    from solana_trader import get_wallet_info
-    await update.message.reply_text(get_wallet_info(), parse_mode="Markdown")
+    """Show ALL wallets: Solana + every EVM chain. /wallet [chain] filters."""
+    parts = []
+    chain = (context.args[0].lower() if context.args else "")
+    if chain in ("", "solana", "sol"):
+        try:
+            from solana_trader import get_wallet_info
+            parts.append(get_wallet_info())
+        except Exception as e:
+            parts.append(f"Solana: error {e}")
+    if chain in ("", "evm", "ethereum", "base", "robinhood", "arbitrum",
+                 "optimism", "polygon"):
+        try:
+            from evm_swap import get_evm_wallet_info
+            evm = get_evm_wallet_info()
+            if chain not in ("", "evm"):
+                # single EVM chain requested — show just that line
+                keep = [ln for ln in evm.splitlines()
+                        if ln.startswith("✳️") or ln.strip().startswith(chain)]
+                evm = "\n".join(keep) if keep else evm
+            parts.append(evm)
+        except Exception as e:
+            parts.append(f"EVM: error {e}")
+    await update.message.reply_text("\n\n".join(parts))
 
 
 async def cmd_buytoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -71,9 +91,26 @@ async def cmd_rugcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     token = context.args[0]
-    from solana_trader import check_rug_risk
-    result = check_rug_risk(token)
-    await update.message.reply_text(f"🔍 *Rug Check: {token.upper()}*\n\n{result}", parse_mode="Markdown")
+    try:
+        from solana_trader import rugcheck_report
+        result = rugcheck_report(token)
+    except Exception as e:
+        result = f"❌ Rug check failed: {e}"
+    await update.message.reply_text(result)
+
+
+async def cmd_importwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Import an existing Solana wallet: /importwallet <base58 keypair|byte array|seed>"""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /importwallet <key>\n\n"
+            "Accepts: base58 keypair (Phantom export — most common), "
+            "JSON byte array [17,23,…] (solana-keygen), or base58/hex 32-byte seed.\n\n"
+            "The key is validated first, existing wallets are backed up, "
+            "and the key is never displayed back.")
+        return
+    from solana_trader import import_solana_wallet
+    await update.message.reply_text(import_solana_wallet(" ".join(context.args)))
 
 
 async def cmd_newwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):

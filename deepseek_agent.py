@@ -14,8 +14,7 @@ import json
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL
-from tools import TOOLS, execute_tool
-from trading_tools import TRADING_TOOL_MAP
+from registry import TOOLS, dispatch_tool
 
 
 # ============================================================
@@ -24,28 +23,17 @@ from trading_tools import TRADING_TOOL_MAP
 
 SYSTEM_PROMPT = """You are an AI crypto trading assistant with access to tools.
 
-MARKET DATA:
-- get_price: Get real-time price for any cryptocurrency (use coin IDs like 'bitcoin', 'ethereum', 'solana')
-- get_top_coins: See top cryptocurrencies by market cap
-- search_coin: Find a coin by name or symbol
-
-PORTFOLIO:
-- get_portfolio: View holdings with live P&L
-- buy: Buy crypto with paper money (simulated). Args: coin, amount_usd
-- sell: Sell crypto holdings. Args: coin, quantity OR percentage
-- get_trade_history: See recent trades
-- reset_portfolio: Start fresh with paper money
-
-GENERAL TOOLS:
-- web_search: Search the web
-- web_fetch: Fetch web page content
-- run_python: Execute Python code
-- run_shell: Run shell commands
+You can:
+- Get real-time prices, top coins, and market data
+- Paper trade and check portfolio P&L
+- Execute real Solana swaps and scan tokens for risk
+- Search the web and fetch pages
+- Read and write files
 
 RULES:
 1. Always check prices before recommending trades.
-2. Never give financial advice — this is paper trading only.
-3. Always confirm the user wants to execute a trade.
+2. Never give financial advice.
+3. Confirm with the user before executing real trades.
 4. Show P&L when discussing positions.
 5. Be concise — users are on Telegram.
 6. Use emoji to make responses scannable."""
@@ -57,6 +45,11 @@ RULES:
 
 class TradingAgent:
     def __init__(self):
+        if not DEEPSEEK_API_KEY:
+            print("Error: DEEPSEEK_API_KEY not set!")
+            print("   Get one at: https://platform.deepseek.com/")
+            print("   Then add it to the .env file.")
+            sys.exit(1)
         self.client = OpenAI(
             api_key=DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com",
@@ -72,161 +65,22 @@ class TradingAgent:
             ]
         return self.user_histories[user_id]
 
-    def _format_tools_for_api(self):
-        """Convert our tool dicts to OpenAI function calling format."""
-        api_tools = []
-
-        # Trading tools
-        for name, desc_info in [
-            ("get_price", "Get current price, 24h change, volume, and market cap for a cryptocurrency."),
-            ("get_top_coins", "Get the top N cryptocurrencies by market cap with prices."),
-            ("search_coin", "Search for a cryptocurrency by name or symbol."),
-            ("get_portfolio", "Show current portfolio with holdings, live values, and P&L."),
-            ("buy", "Buy cryptocurrency with paper money. Args: coin (string), amount_usd (number)."),
-            ("sell", "Sell cryptocurrency. Args: coin (string), quantity (number, optional), percentage (number, optional)."),
-            ("get_trade_history", "Show recent trade history."),
-            ("reset_portfolio", "Reset portfolio. Args: starting_balance (number, optional, default 10000)."),
-        ]:
-            params = {"type": "object", "properties": {}, "required": []}
-            if name == "get_price":
-                params["properties"]["coin"] = {"type": "string", "description": "Coin name or symbol (e.g., bitcoin, btc, eth)"}
-                params["required"] = ["coin"]
-            elif name == "get_top_coins":
-                params["properties"]["n"] = {"type": "number", "description": "Number of coins (default 10)"}
-            elif name == "search_coin":
-                params["properties"]["query"] = {"type": "string", "description": "Search query"}
-                params["required"] = ["query"]
-            elif name == "buy":
-                params["properties"]["coin"] = {"type": "string", "description": "Coin to buy (e.g., btc, eth)"}
-                params["properties"]["amount_usd"] = {"type": "number", "description": "USD amount to spend"}
-                params["required"] = ["coin", "amount_usd"]
-            elif name == "sell":
-                params["properties"]["coin"] = {"type": "string", "description": "Coin to sell"}
-                params["properties"]["quantity"] = {"type": "number", "description": "Quantity to sell (omit to sell all)"}
-                params["properties"]["percentage"] = {"type": "number", "description": "Percentage to sell (e.g., 50)"}
-                params["required"] = ["coin"]
-            elif name == "reset_portfolio":
-                params["properties"]["starting_balance"] = {"type": "number", "description": "Starting balance (default 10000)"}
-            elif name == "get_trade_history":
-                params["properties"]["n"] = {"type": "number", "description": "Number of trades to show"}
-
-            api_tools.append({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": desc_info,
-                    "parameters": params,
-                }
-            })
-
-        # General tools
-        api_tools.extend([
-            {
-                "type": "function",
-                "function": {
-                    "name": "web_search",
-                    "description": "Search the web for information.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"query": {"type": "string", "description": "Search query"}},
-                        "required": ["query"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "web_fetch",
-                    "description": "Fetch and read a URL's content.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"url": {"type": "string", "description": "URL to fetch"}},
-                        "required": ["url"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_python",
-                    "description": "Execute Python code and return output.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"code": {"type": "string", "description": "Python code to run"}},
-                        "required": ["code"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_shell",
-                    "description": "Run a shell command.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"command": {"type": "string", "description": "Shell command"}},
-                        "required": ["command"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read a file from workspace.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"path": {"type": "string", "description": "File path"}},
-                        "required": ["path"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "description": "Write content to a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "File path"},
-                            "content": {"type": "string", "description": "Content to write"}
-                        },
-                        "required": ["path", "content"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_files",
-                    "description": "List files in workspace.",
-                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
-                }
-            },
-        ])
-
-        return api_tools
-
-    def _execute_tool(self, name: str, args: dict) -> str:
-        """Execute a tool by name."""
-        if name in TRADING_TOOL_MAP:
-            return TRADING_TOOL_MAP[name](args)
-        return execute_tool(name, args)
+    def _execute_tool(self, name: str, args: dict, user_id: int = 0) -> str:
+        """Execute any registered tool via the unified registry."""
+        return dispatch_tool(name, args, user_id=user_id)
 
     def handle_message(self, user_id: int, message: str) -> str:
         """Process a user message through the agent loop."""
         history = self._get_history(user_id)
         history.append({"role": "user", "content": message})
-        tools = self._format_tools_for_api()
 
-        # Agent loop — no rate limit worries!
+        # Agent loop
         for step in range(10):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=history,
-                    tools=tools,
+                    tools=TOOLS,
                     tool_choice="auto",
                     max_tokens=2000,
                     temperature=0.7,
@@ -268,9 +122,14 @@ class TradingAgent:
 
                 print(f"  [{step+1}] {tool_name}({json.dumps(tool_args, default=str)[:120]})")
 
-                result = self._execute_tool(tool_name, tool_args)
-                display = result[:150] + "..." if len(result) > 150 else result
-                print(f"     -> {display}")
+                try:
+                    result = self._execute_tool(tool_name, tool_args, user_id=user_id)
+                except Exception as e:
+                    result = f"Tool error: {str(e)}"
+                if len(result) > 2000:
+                    result = result[:2000] + "... (truncated)"
+
+                print(f"      -> {result[:150]}")
 
                 history.append({
                     "role": "tool",
@@ -278,56 +137,53 @@ class TradingAgent:
                     "content": result,
                 })
 
-        # Extract final response
-        final = ""
-        for msg in reversed(history):
-            if msg.get("role") == "assistant" and msg.get("content"):
-                final = msg["content"]
-                break
-
-        return final or "(Max steps reached)"
+        return "(Max steps reached)"
 
 
 # ============================================================
-# Interactive Mode
+# CLI
 # ============================================================
 
-def main():
-    if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:])
-        agent = TradingAgent()
-        print(f"Running: {task}\n")
-        result = agent.handle_message(0, task)
-        print(f"\nResult:\n{result}")
-    else:
-        print("=" * 50)
-        print("  🤖 DeepSeek Trading Agent")
-        print("=" * 50)
-        print(f"  Model: {DEEPSEEK_MODEL}")
-        print(f"  Cost: ~$0.0003 per request")
-        print(f"  Rate limits: None!")
-        print(f"  Type 'quit' to exit\n")
+def print_banner():
+    print("=" * 50)
+    print("  DeepSeek Trading Agent")
+    print("=" * 50)
+    print(f"  Model: {DEEPSEEK_MODEL}")
+    print("  Type 'quit' or 'exit' to stop.\n")
 
-        agent = TradingAgent()
 
-        while True:
-            try:
-                user_input = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nBye!")
-                break
+def interactive_mode():
+    print_banner()
+    agent = TradingAgent()
+    print("Agent ready! Ask me anything.\n")
 
-            if not user_input:
-                continue
-            if user_input.lower() in ("quit", "exit", "q"):
-                print("Bye!")
-                break
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("quit", "exit", "q"):
+            print("Bye!")
+            break
 
-            print()
-            result = agent.handle_message(0, user_input)
-            print(f"\nAgent: {result}\n")
-            print("-" * 50)
+        print()
+        response = agent.handle_message(0, user_input)
+        print(f"\nAgent: {response}\n")
+        print("-" * 50)
+
+
+def single_task_mode(task: str):
+    print(f"Running: {task}\n")
+    agent = TradingAgent()
+    response = agent.handle_message(0, task)
+    print(f"\nResult:\n{response}")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        single_task_mode(" ".join(sys.argv[1:]))
+    else:
+        interactive_mode()

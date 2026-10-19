@@ -57,14 +57,15 @@ SOLANA_TOOLS = [
         "type": "function",
         "function": {
             "name": "buy_token",
-            "description": "Buy a Solana token with SOL. REAL MONEY. Executes a swap on Jupiter DEX.",
+            "description": "Buy a Solana token with SOL. REAL MONEY. Executes a swap on Jupiter DEX. When the user states a size in DOLLARS (e.g. 'buy $20 of WIF'), pass usd_amount — it converts at the live SOL rate. Only pass sol_amount when the user is explicit about SOL.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {"type": "string", "description": "Token to buy (e.g., WIF, BONK, PEPE)"},
-                    "sol_amount": {"type": "number", "description": "Amount of SOL to spend"}
+                    "usd_amount": {"type": "number", "description": "Size in US dollars — PREFERRED when the user said '$X'"},
+                    "sol_amount": {"type": "number", "description": "Amount of SOL to spend (only when user is explicit about SOL)"}
                 },
-                "required": ["symbol", "sol_amount"]
+                "required": ["symbol"]
             }
         }
     },
@@ -100,6 +101,34 @@ SOLANA_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "rugcheck_report",
+            "description": "REAL rug-pull report from RugCheck.xyz for a Solana token: risk score 0-100, LP lock %, flagged dangers. Accepts a mint address or known symbol (WIF, JUP…). Use before any Solana buy.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "token": {"type": "string", "description": "Mint address or known symbol"}
+                },
+                "required": ["token"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "import_solana_wallet",
+            "description": "Import an EXISTING Solana wallet from: base58 keypair (Phantom export, most common), JSON byte array (solana-keygen), or base58/hex 32-byte seed. Validates by deriving the keypair, backs up existing wallet files, writes both on-disk formats. Key never displayed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key_material": {"type": "string", "description": "base58 keypair / byte array / seed"}
+                },
+                "required": ["key_material"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_wallet_address",
             "description": "Get the current wallet's Solana address.",
             "parameters": {"type": "object", "properties": {}}
@@ -123,6 +152,10 @@ SOLANA_TOOLS = [
 def execute_solana_tool(name: str, args: dict) -> str:
     """Execute a Solana trading tool."""
     try:
+        if name == "import_solana_wallet":
+            from solana_trader import import_solana_wallet
+            return import_solana_wallet(args.get("key_material", ""))
+
         if name == "generate_wallet":
             wallet = generate_wallet()
             return (
@@ -173,10 +206,12 @@ def execute_solana_tool(name: str, args: dict) -> str:
 
         elif name == "buy_token":
             symbol = args.get("symbol", "").upper()
-            sol_amount = float(args.get("sol_amount", 0))
-            if sol_amount <= 0:
-                return "Error: sol_amount must be positive"
-            return buy_token(symbol, sol_amount)
+            sol_amount = float(args.get("sol_amount", 0) or 0)
+            usd_amount = args.get("usd_amount")
+            usd_amount = float(usd_amount) if usd_amount is not None else None
+            if sol_amount <= 0 and usd_amount is None:
+                return "Error: pass sol_amount or usd_amount"
+            return buy_token(symbol, sol_amount, usd_amount=usd_amount)
 
         elif name == "sell_token":
             symbol = args.get("symbol", "").upper()
@@ -186,6 +221,10 @@ def execute_solana_tool(name: str, args: dict) -> str:
         elif name == "rug_check":
             symbol = args.get("symbol", "").upper()
             return check_rug_risk(symbol)
+
+        elif name == "rugcheck_report":
+            from solana_trader import rugcheck_report
+            return rugcheck_report(args.get("token", args.get("symbol", "")))
 
         elif name == "get_wallet_address":
             return f"Wallet address: {get_wallet_address()}"

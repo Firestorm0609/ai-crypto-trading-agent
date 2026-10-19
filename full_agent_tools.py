@@ -21,7 +21,9 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-PROJECT_ROOT = Path("/root/gemini-agent")
+# Project root resolved from this file's location — survives renames of
+# the project symlink (e.g. gemini-agent → Aesir).
+PROJECT_ROOT = Path(__file__).resolve().parent
 TODOS_DIR = PROJECT_ROOT / "agent_todos"
 TODOS_DIR.mkdir(exist_ok=True)
 

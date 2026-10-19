@@ -26,10 +26,15 @@ WALLETS_DIR.mkdir(exist_ok=True)
 
 SOLANA_WALLET_FILE = WALLETS_DIR / "solana_wallet.json"
 EVM_WALLET_FILE = WALLETS_DIR / "evm_wallet.json"
-BASE_WALLET_FILE = WALLETS_DIR / "base_wallet.json"
+# Base uses the Ethereum wallet — no separate Base wallet file.
+BASE_WALLET_FILE = EVM_WALLET_FILE
 
 # RPC endpoints
-SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+try:
+    from evm_swap import solana_rpc
+    SOLANA_RPC = solana_rpc()      # Helius -> Alchemy -> public (best available)
+except Exception:
+    SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 ETH_RPC = "https://eth.llamarpc.com"
 BASE_RPC = "https://mainnet.base.org"
 
@@ -132,7 +137,10 @@ def mint_solana_nft(collection: str, name: str, symbol: str = "NFT",
         )[0]
 
         # Build create metadata instruction
-        # This is a simplified version - real Metaplex Core uses more accounts
+        # NOTE: this instruction layout is simplified and NOT a valid
+        # Metaplex create_metadata_account_v3 payload (name/uri must be
+        # borsh-encoded with length prefixes, and more accounts are needed).
+        # Until fully implemented, Solana minting returns instructions only.
         create_ix = Instruction(
             program_id=TOKEN_METADATA_PROGRAM,
             accounts=[
@@ -199,10 +207,8 @@ def _check_solana_balance(pubkey: str) -> float:
 # ============================================================
 
 def _get_evm_wallet(chain: str = "ethereum") -> dict:
-    """Load EVM wallet."""
-    if chain == "base" and BASE_WALLET_FILE.exists():
-        return json.loads(BASE_WALLET_FILE.read_text())
-    elif EVM_WALLET_FILE.exists():
+    """Load EVM wallet. Base shares the Ethereum wallet."""
+    if EVM_WALLET_FILE.exists():
         return json.loads(EVM_WALLET_FILE.read_text())
     return None
 
@@ -218,13 +224,146 @@ def _create_evm_wallet(chain: str = "ethereum") -> dict:
             "chain": chain,
             "created_at": datetime.now().isoformat(),
         }
-        if chain == "base":
-            BASE_WALLET_FILE.write_text(json.dumps(wallet, indent=2))
-        else:
-            EVM_WALLET_FILE.write_text(json.dumps(wallet, indent=2))
+        # Base shares the Ethereum wallet — no separate Base wallet file.
+        EVM_WALLET_FILE.write_text(json.dumps(wallet, indent=2))
         return wallet
     except Exception as e:
         return {"error": str(e)}
+
+
+def _backup_evm_wallet(tag: str) -> str:
+    """Back up every existing EVM wallet file before touching wallet state.
+    Files land in wallets/backups/<tag>_ (gitignored with the rest of wallets/).
+    Returns how many files were backed up."""
+    bdir = WALLETS_DIR / "backups"
+    bdir.mkdir(exist_ok=True)
+    n = 0
+    for f in WALLETS_DIR.glob("evm*.json"):
+        try:
+            (bdir / f"{tag}_{f.name}").write_text(f.read_text())
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+# Chains that keep their own evm_<chain>.json wallet file (checked by
+# evm_swap._load_wallet BEFORE the shared evm_wallet.json).
+_EVM_CHAIN_FILES = {
+    "ethereum": "evm_ethereum.json", "base": "evm_base.json",
+    "arbitrum": "evm_arbitrum.json", "optimism": "evm_optimism.json",
+    "polygon": "evm_polygon.json", "robinhood": "evm_robinhood.json",
+}
+
+
+def import_evm_wallet(private_key: str, chain: str = "all") -> str:
+    """Import an EXISTING EVM wallet from a raw hex private key.
+
+    Validates the key, refuses to silently overwrite existing wallets
+    (backs them up and reports exactly what was replaced), and never
+    echoes the key back. The same key works on every EVM chain.
+
+    chain="all" (default): write the shared evm_wallet.json AND refresh
+      every per-chain evm_<chain>.json so no stale different-key file
+      shadows the import.
+    chain=<specific>: only write that chain's file (plus shared if absent).
+    """
+    key = (private_key or "").strip().strip('"').strip("'")
+    if key.startswith("0x") or key.startswith("0X"):
+        key = key[2:]
+    if not key or not all(c in "0123456789abcdefABCDEF" for c in key) or len(key) != 64:
+        return (
+            "❌ Invalid private key. Expected a 64-hex-char key (with or "
+            "without the leading 0x). Example shape: 0xabc123…def (64 chars total)."
+        )
+
+    try:
+        from eth_account import Account
+        account = Account.from_key("0x" + key)
+    except Exception as e:
+        return f"❌ Key could not be validated: {type(e).__name__}"
+
+    chain = (chain or "all").lower().strip()
+    if chain != "all" and chain not in _EVM_CHAIN_FILES:
+        return f"❌ Unknown chain {chain!r}. Use one of: {', '.join(_EVM_CHAIN_FILES)} or 'all'."
+
+    # What exists today, so we can report exactly what gets replaced.
+    existing_shared = None
+    if EVM_WALLET_FILE.exists():
+        try:
+            existing_shared = json.loads(EVM_WALLET_FILE.read_text())
+        except Exception:
+            existing_shared = {"error": "unreadable"}
+    existing_chains = {}
+    for ch, fname in _EVM_CHAIN_FILES.items():
+        p = WALLETS_DIR / fname
+        if p.exists():
+            try:
+                existing_chains[ch] = json.loads(p.read_text())
+            except Exception:
+                existing_chains[ch] = {"error": "unreadable"}
+
+    n_backed = _backup_evm_wallet(datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    new_wallet = {
+        "address": account.address,
+        "private_key": "0x" + key,
+        "chain": chain if chain != "all" else "evm",
+        "created_at": datetime.now().isoformat(),
+        "imported": True,
+    }
+
+    written = []
+    if chain == "all":
+        EVM_WALLET_FILE.write_text(json.dumps(new_wallet, indent=2))
+        written.append("shared evm_wallet.json")
+        for ch, fname in _EVM_CHAIN_FILES.items():
+            (WALLETS_DIR / fname).write_text(json.dumps(new_wallet, indent=2))
+            written.append(fname)
+    else:
+        (WALLETS_DIR / _EVM_CHAIN_FILES[chain]).write_text(json.dumps(new_wallet, indent=2))
+        written.append(_EVM_CHAIN_FILES[chain])
+        if not EVM_WALLET_FILE.exists():
+            EVM_WALLET_FILE.write_text(json.dumps(new_wallet, indent=2))
+            written.append("shared evm_wallet.json (was absent)")
+
+    # Report differences WITHOUT printing any keys.
+    def _diff(old):
+        if old is None:
+            return None
+        if "error" in old:
+            return "unreadable"
+        return None if old.get("address", "").lower() == account.address.lower() else old.get("address", "?")
+
+    lines = [
+        "✅ EVM wallet imported",
+        "",
+        f"Address: {account.address}",
+        f"Scope: {('ALL EVM chains (' + ', '.join(sorted(set(_EVM_CHAIN_FILES))) + ')') if chain == 'all' else chain}",
+        "",
+    ]
+    if existing_shared is None:
+        lines.append("• Shared evm_wallet.json: created (none existed)")
+    else:
+        d = _diff(existing_shared)
+        lines.append(f"• Shared evm_wallet.json: {'REPLACED — previous wallet ' + d if d else 'same key already — refreshed'}")
+    if chain == "all":
+        replaced = [ch for ch, old in existing_chains.items() if _diff(old)]
+        same = [ch for ch, old in existing_chains.items() if not _diff(old)]
+        if replaced:
+            lines.append(f"• Per-chain files REPLACED (held a different wallet): {', '.join(sorted(replaced))}")
+        if same:
+            lines.append(f"• Per-chain files already matched: {', '.join(sorted(same))}")
+        if not existing_chains:
+            lines.append("• No per-chain files existed — created for all chains")
+    lines += [
+        "",
+        f"🔒 Private key stored locally in wallets/ (never displayed). {n_backed} file(s) backed up to wallets/backups/ before any change.",
+        "⚠️ If this key was pasted into any chat, consider the wallet hot: move large holdings to a fresh key and only keep trading funds here.",
+        "",
+        "Fund the address with gas (ETH on ethereum/base/robinhood, POL on polygon, …) to trade.",
+    ]
+    return "\n".join(lines)
 
 
 def _check_evm_balance(address: str, chain: str = "ethereum") -> float:
@@ -374,6 +513,15 @@ def mint_evm_nft(contract_address: str, chain: str = "ethereum",
 
         # Send transaction
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            import trade_journal
+            trade_journal.log_trade(
+                kind="mint", chain=chain, token=contract_address[:10] + "…",
+                token_addr=contract_address, amount=1,
+                native=f"{mint_eth:.5f} ETH", tx=tx_hash.hex(),
+                status="broadcasted", source="manual")
+        except Exception:
+            pass
 
         return (
             f"🎨 NFT Minted!\n\n"
@@ -391,32 +539,25 @@ def mint_evm_nft(contract_address: str, chain: str = "ethereum",
 
 
 # ============================================================
-# Robinhood NFT (Robinhood Wallet integration)
+# Robinhood NFT (real path — delegates to the on-chain mint engine)
 # ============================================================
 
-def mint_robinhood_nft(collection: str, name: str, chain: str = "base") -> str:
-    """
-    Mint NFT via Robinhood Wallet.
-    Robinhood Wallet supports NFTs on Ethereum, Base, and Arbitrum.
-    """
+def mint_robinhood_nft(collection: str, name: str, chain: str = "robinhood") -> str:
+    """Mint on Robinhood chain. If the caller passed a deployed contract
+    address, execute a REAL on-chain mint via mint_contract. Otherwise give
+    honest guidance (no fake 'open the app' instructions)."""
+    c = (collection or "").strip()
+    if c.lower().startswith("0x") and len(c) == 42:
+        from opensea_tools import mint_contract
+        return mint_contract(chain="robinhood", contract=c, quantity=1)
     return (
-        f"🎨 Robinhood Wallet NFT\n\n"
-        f"Collection: {collection}\n"
-        f"Name: {name}\n"
-        f"Chain: {chain.title()}\n\n"
-        f"Robinhood Wallet supports NFTs on:\n"
-        f"• Ethereum\n"
-        f"• Base\n"
-        f"• Arbitrum\n\n"
-        f"Same EVM wallet works everywhere:\n"
-        f"Create with /nftwallet ethereum or /nftwallet base\n"
-        f"Import into Robinhood Wallet app using private key\n"
-        f"Same address, same keys, all EVM chains\n\n"
-        f"To mint:\n"
-        f"1. Open Robinhood Wallet app\n"
-        f"2. Go to NFT section\n"
-        f"3. Browse collections or enter contract address\n"
-        f"4. Tap 'Mint' or 'Buy'"
+        f"❌ Minting needs a CONTRACT ADDRESS on robinhood chain (0x…), "
+        f"not a collection name.\n\n"
+        f"Find one:\n"
+        f"• opensea_free_mints(chain='robinhood') — live free-mint scan\n"
+        f"• scan_contract_mint(chain='robinhood', contract=0x…) — verify a "
+        f"contract is open/affordable before minting\n"
+        f"• Then I mint on-chain directly with your wallet."
     )
 
 
@@ -447,102 +588,71 @@ def get_nft_floor(collection: str, chain: str = "solana") -> str:
         except Exception:
             pass
 
-    # Try OpenSea API for EVM
-    if chain in ("ethereum", "base"):
+    # Try OpenSea API for EVM (all chains OpenSea indexes, robinhood included)
+    if chain in ("ethereum", "base", "arbitrum", "optimism", "polygon", "robinhood"):
+        # Prefer the richer opensea_tools implementation (chain-aware,
+        # USD conversion, honest missing-data handling)
         try:
-            url = f"https://api.opensea.io/api/v2/collections/{collection}/stats"
-            req = urllib.request.Request(url, headers={"User-Agent": "TradingAgent/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            floor = data.get("total", {}).get("floor_price", 0)
-            return (
-                f"🖼️ {collection.title()} ({chain.title()})\n\n"
-                f"Floor: {floor:.4f} ETH"
-            )
+            from opensea_tools import opensea_floor
+            return opensea_floor(collection, chain)
         except Exception:
             pass
 
-    # Fallback to hardcoded data
-    return _get_nft_floor_offline(collection, chain)
+    # No fabricated fallbacks: if the live APIs failed, say so.
+    return (f"❌ Could not fetch live floor for '{collection}' on {chain}. "
+            f"Magic Eden (Solana) and OpenSea (EVM) both failed or the "
+            f"collection is not indexed there. Check the slug/chain and retry.")
 
 
-def _get_nft_floor_offline(collection: str, chain: str) -> str:
-    """Offline floor price data."""
-    POPULAR_NFTS = {
-        "solana": [
-            {"name": "Mad Lads", "collection": "madlads", "floor": 120},
-            {"name": "Tensorians", "collection": "tensorians", "floor": 45},
-            {"name": "Okay Bears", "collection": "okaybears", "floor": 25},
-            {"name": "DeGods", "collection": "degods", "floor": 15},
-            {"name": "y00ts", "collection": "y00ts", "floor": 8},
-            {"name": "Solana Monkey Business", "collection": "solana-monkey-business", "floor": 50},
-        ],
-        "ethereum": [
-            {"name": "Bored Ape Yacht Club", "collection": "boredapeyachtclub", "floor": 15},
-            {"name": "CryptoPunks", "collection": "cryptopunks", "floor": 25},
-            {"name": "Azuki", "collection": "azuki", "floor": 5},
-            {"name": "Pudgy Penguins", "collection": "pudgypenguins", "floor": 8},
-            {"name": "Doodles", "collection": "doodles", "floor": 2},
-        ],
-        "base": [
-            {"name": "Parallel Life", "collection": "parallellife", "floor": 0.8},
-            {"name": "Based Ghouls", "collection": "basedghouls", "floor": 0.05},
-        ],
-    }
+def get_popular_nfts(chain: str = "ethereum") -> str:
+    """LIVE trending NFT collections, from OpenSea's public collections API
+    (ordered by 24h volume). No hardcoded data anywhere — if the API fails,
+    the error is shown, never stale numbers."""
+    chain = (chain or "ethereum").lower().strip()
 
-    chain_nfts = POPULAR_NFTS.get(chain, [])
-    for nft in chain_nfts:
-        if collection in nft["collection"].lower():
-            symbol = "SOL" if chain == "solana" else "ETH"
-            return (
-                f"🖼️ {nft['name']} ({chain.title()})\n\n"
-                f"Floor: {nft['floor']} {symbol}\n\n"
-                f"Buy: /buynft {nft['collection']} {chain}"
-            )
+    # OpenSea covers every EVM chain we support
+    if chain in ("ethereum", "base", "arbitrum", "optimism", "polygon", "robinhood"):
+        try:
+            url = (f"https://api.opensea.io/api/v2/collections?chain={chain}"
+                   f"&order_by=one_day_volume&limit=10")
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 aesir-agent/1.0",
+                "accept": "application/json",
+            })
+            # OpenSea API key (same one opensea_tools uses)
+            try:
+                from opensea_tools import OPENSEA_API_KEY
+                if OPENSEA_API_KEY:
+                    req.add_header("x-api-key", OPENSEA_API_KEY)
+            except Exception:
+                pass
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                cols = json.loads(resp.read().decode())
+            if isinstance(cols, dict):
+                cols = cols.get("collections", [])
+            if not cols:
+                return f"No trending collections returned for {chain} right now."
+            lines = [f"🖼️ Top NFT collections on {chain.title()} (24h volume, live):\n"]
+            # Pull floors in one extra stats call per collection (best-effort)
+            for c in cols[:10]:
+                slug = c.get("collection", "?")
+                name = c.get("name") or slug
+                lines.append(f"• {name}  (slug: {slug})")
+            lines.append("\nGet a floor with: opensea_floor(collection, chain) "
+                         "or say 'floor of <slug> on <chain>'")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"❌ OpenSea trending failed: {e}"
 
-    return f"❌ Collection '{collection}' not found on {chain}"
+    if chain == "solana":
+        # Magic Eden's free trending/list endpoints were retired (now require
+        # a paid API key) — report honestly instead of serving stale numbers.
+        return ("❌ No free live trending source for Solana NFTs right now "
+                "(Magic Eden retired their open API). I can still check any "
+                "specific collection: give me a slug like 'madlads' and I'll "
+                "pull its live stats. Or check magiceden.io directly.")
 
-
-def get_popular_nfts(chain: str = "solana") -> str:
-    """Get popular NFT collections across chains."""
-    data = {
-        "solana": [
-            ("Mad Lads", "madlads", 120, "SOL"),
-            ("Tensorians", "tensorians", 45, "SOL"),
-            ("Okay Bears", "okaybears", 25, "SOL"),
-            ("DeGods", "degods", 15, "SOL"),
-            ("y00ts", "y00ts", 8, "SOL"),
-            ("Solana Monkey Business", "solana-monkey-business", 50, "SOL"),
-            ("Ape Society", "apesociety", 12, "SOL"),
-        ],
-        "ethereum": [
-            ("Bored Ape Yacht Club", "boredapeyachtclub", 15, "ETH"),
-            ("CryptoPunks", "cryptopunks", 25, "ETH"),
-            ("Azuki", "azuki", 5, "ETH"),
-            ("Pudgy Penguins", "pudgypenguins", 8, "ETH"),
-            ("Doodles", "doodles", 2, "ETH"),
-            ("CloneX", "clonex", 1.5, "ETH"),
-        ],
-        "base": [
-            ("Parallel Life", "parallellife", 0.8, "ETH"),
-            ("BASEmint", "basemint", 0.05, "ETH"),
-        ],
-        "robinhood": [
-            ("Robinhood Hoodies", "robinhood-hoodies", 0, "Free"),
-            ("HOOD NFTs", "hood-nfts", 0, "Free"),
-        ],
-    }
-
-    chain_nfts = data.get(chain, [])
-    if not chain_nfts:
-        return f"No NFT data for {chain} yet."
-
-    lines = [f"🖼️ Popular NFTs on {chain.title()}\n"]
-    for name, slug, floor, symbol in chain_nfts:
-        lines.append(f"• {name} — Floor: {floor} {symbol}")
-    lines.append(f"\nBuy: /buynft COLLECTION_NAME {chain}")
-    lines.append(f"Mint: /mintnft COLLECTION_NAME NAME {chain}")
-    return "\n".join(lines)
+    return f"❌ Unknown chain '{chain}'. Use ethereum/base/arbitrum/optimism/polygon/robinhood/solana."
 
 
 # ============================================================
@@ -550,10 +660,18 @@ def get_popular_nfts(chain: str = "solana") -> str:
 # ============================================================
 
 def buy_nft(collection: str, chain: str = "solana", max_price: float = None) -> str:
-    """Buy an NFT from a collection."""
+    """NFT buying info. NOT executable: no marketplace API is wired up."""
     floor_data = get_nft_floor(collection, chain)
     symbol = "SOL" if chain == "solana" else "ETH"
 
+    if chain in ("ethereum", "base", "arbitrum", "optimism", "polygon", "robinhood"):
+        return (
+            f"🛒 Buy NFT\n\n"
+            f"{floor_data}\n\n"
+            f"✅ REAL purchases ARE possible via OpenSea: use the opensea_buy_nft "
+            f"tool (opensea_best_listings first to find orders + floor).\n"
+            f"Solana NFTs cannot be bought through OpenSea from this bot."
+        )
     return (
         f"🛒 Buy NFT\n\n"
         f"{floor_data}\n\n"
@@ -570,9 +688,20 @@ def buy_nft(collection: str, chain: str = "solana", max_price: float = None) -> 
 
 def sell_nft(collection: str, token_id: str = None, chain: str = "solana",
              price: float = None) -> str:
-    """List an NFT for sale."""
+    """NFT listing info. Real listing IS available via OpenSea on EVM chains."""
     symbol = "SOL" if chain == "solana" else "ETH"
 
+    if chain in ("ethereum", "base", "arbitrum", "optimism", "polygon"):
+        return (
+            f"🏷️ List NFT for Sale\n\n"
+            f"Collection: {collection}\n"
+            f"Token ID: {token_id or 'Select from wallet'}\n"
+            f"Price: {price or 'Set price'} {symbol}\n"
+            f"Chain: {chain.title()}\n\n"
+            f"✅ REAL listings ARE possible via OpenSea: use the opensea_list_nft "
+            f"tool (contract + token_id + price).\n"
+            f"Solana listings are not possible from this bot."
+        )
     return (
         f"🏷️ List NFT for Sale\n\n"
         f"Collection: {collection}\n"
@@ -588,61 +717,155 @@ def sell_nft(collection: str, token_id: str = None, chain: str = "solana",
 
 
 def create_collection(name: str, symbol: str, chain: str = "solana") -> str:
-    """Create a new NFT collection."""
+    """Guidance for creating a collection. HONEST: this bot cannot yet deploy
+    contracts — says so explicitly instead of pretending."""
     if chain == "solana":
         return (
-            f"🎨 Create Collection (Solana)\n\n"
-            f"Name: {name}\n"
-            f"Symbol: {symbol}\n"
-            f"Standard: Metaplex Core\n"
-            f"Cost: ~0.1 SOL\n\n"
-            f"Features:\n"
-            f"• Low fees (~$0.01 per mint)\n"
-            f"• Compressed NFTs (Bubblegum)\n"
-            f"• Candy Machine for batch minting\n"
-            f"• Royalties built-in"
+            f"🎨 Create Collection (Solana) — GUIDANCE ONLY\n\n"
+            f"Name: {name} | Symbol: {symbol} | Standard: Metaplex Core\n\n"
+            f"⚠️ This bot cannot DEPLOY a collection yet — no Metaplex deploy "
+            f"is wired up, and I won't pretend otherwise.\n\n"
+            f"What exists today: minting individual NFTs (mint_nft on Solana "
+            f"via Metaplex, or direct ERC-721 mints on any EVM chain via "
+            f"mint_contract).\n\n"
+            f"To deploy a real collection: Candy Machine (Solana, via "
+            f"sugar CLI) or OpenZeppelin ERC-721 + Etherscan deployer "
+            f"(EVM). Both can be done externally with your wallet key."
         )
-    else:
-        return (
-            f"🎨 Create Collection ({chain.title()})\n\n"
-            f"Name: {name}\n"
-            f"Symbol: {symbol}\n"
-            f"Standard: ERC-721\n"
-            f"Chain: {chain.title()}\n"
-            f"Cost: Gas fee\n\n"
-            f"Features:\n"
-            f"• OpenZeppelin contracts\n"
-            f"• Royalties (ERC-2981)\n"
-            f"• Metadata on IPFS\n"
-            f"• Lazy minting available"
-        )
+    return (
+        f"🎨 Create Collection ({chain.title()}) — GUIDANCE ONLY\n\n"
+        f"Name: {name} | Symbol: {symbol} | Standard: ERC-721\n\n"
+        f"⚠️ This bot cannot DEPLOY a collection yet — no contract deployer "
+        f"is wired up, and I won't pretend otherwise.\n\n"
+        f"What exists today: minting into EXISTING contracts via "
+        f"mint_contract(chain, contract=0x…) on every EVM chain, "
+        f"robinhood included.\n\n"
+        f"To deploy your own: OpenZeppelin ERC-721 via Remix/Etherscan with "
+        f"your wallet, then I can mint into it."
+    )
 
 
 def get_nft_portfolio(chain: str = "solana") -> str:
-    """Get NFT portfolio from connected wallets."""
-    lines = [f"🖼️ NFT Portfolio ({chain.title()})\n"]
+    """REAL NFT portfolio for a wallet: native balance + actual holdings
+    (OpenSea API on EVM chains, Helius DAS on Solana when quota allows).
+    chain='all' shows every chain at once."""
+    chain = (chain or "solana").lower().strip()
+
+    if chain == "all":
+        return "\n\n".join(get_nft_portfolio(c) for c in
+                           ("solana", "ethereum", "base", "robinhood"))
 
     if chain == "solana":
         wallet = _get_solana_wallet()
-        if wallet:
-            balance = _check_solana_balance(wallet["public_key"])
-            lines.append(f"Wallet: {wallet['public_key'][:8]}...{wallet['public_key'][-4:]}")
-            lines.append(f"SOL Balance: {balance:.4f}")
-            lines.append(f"\nNFTs displayed once wallet is connected.")
-        else:
-            lines.append("No wallet found. Create with: /newwallet")
-    elif chain in ("ethereum", "base"):
-        wallet = _get_evm_wallet(chain)
-        if wallet:
-            balance = _check_evm_balance(wallet["address"], chain)
-            symbol = "ETH"
-            lines.append(f"Wallet: {wallet['address'][:8]}...{wallet['address'][-4:]}")
-            lines.append(f"{symbol} Balance: {balance:.6f}")
-        else:
-            lines.append(f"No {chain.title()} wallet found. Create with: /newwallet")
-    elif chain == "robinhood":
-        lines.append("Robinhood Wallet: Open Robinhood Wallet app to view NFTs")
+        if not wallet:
+            return "❌ No Solana wallet. Import with /importwallet (keeps your key) or new_wallet (fresh)."
+        pub = wallet["public_key"]
+        bal = _check_solana_balance(pub)
+        lines = [f"🖼️ Solana NFT wallet", f"{pub}", f"SOL: {bal:.4f}"]
+        try:
+            import urllib.request
+            from solana_trader import SOLANA_RPC
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "getAssetsByOwner",
+                       "params": {"ownerAddress": pub, "limit": 50}}
+            req = urllib.request.Request(
+                SOLANA_RPC, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 aesir-agent/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                items = ((json.loads(r.read()).get("result") or {}).get("items")) or []
+            nfts = [i for i in items
+                    if i.get("interface", "") not in ("", "FungibleToken", "FungibleAsset")]
+            if nfts:
+                lines.append(f"\nNFTs ({len(nfts)}):")
+                for i in nfts[:15]:
+                    meta = (i.get("content") or {}).get("metadata") or {}
+                    lines.append(f"  • {meta.get('name') or i.get('id', '?')[:10]}")
+            else:
+                lines.append("\nNo NFTs in this wallet.")
+        except Exception:
+            lines.append("\n(Holdings index unavailable — Solana NFT API quota exhausted. Balance above is live.)")
+        return "\n".join(lines)
 
+    # EVM chains — wallet from the real loader (per-chain file → shared file)
+    try:
+        from evm_swap import _load_wallet, alchemy_rpc
+        from opensea_tools import OS_CHAINS
+    except Exception as e:
+        return f"❌ {e}"
+
+    if chain == "robinhood":
+        # OpenSea doesn't index Robinhood chain — use Alchemy's NFT REST API.
+        wallet = _load_wallet("robinhood")
+        if not wallet or not wallet.get("address"):
+            return "❌ No EVM wallet. import_evm_wallet covers Robinhood too."
+        addr = wallet["address"]
+        lines = ["🖼️ Robinhood NFT wallet", addr]
+        try:
+            from evm_swap import ALCHEMY_KEY
+            import urllib.request
+            bal_req = urllib.request.Request(
+                alchemy_rpc("robinhood"),
+                data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                 "method": "eth_getBalance",
+                                 "params": [addr, "latest"]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(bal_req, timeout=8) as r:
+                bal = int(json.loads(r.read()).get("result", "0x0"), 16) / 1e18
+            lines.append(f"ETH: {bal:.5f}")
+            nft_req = urllib.request.Request(
+                f"https://robinhood-mainnet.g.alchemy.com/nft/v2/{ALCHEMY_KEY}/getNFTs/",
+                data=json.dumps({"owner": addr, "pageSize": 30}).encode(),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 aesir-agent/1.0"})
+            with urllib.request.urlopen(nft_req, timeout=15) as r:
+                owned = (json.loads(r.read()) or {}).get("ownedNfts", [])
+            real = [n for n in owned if not (n.get("title") or "").startswith("UNIVERSAL")]
+            if real:
+                lines.append(f"\nNFTs ({len(real)}):")
+                for n in real[:15]:
+                    lines.append(f"  • {n.get('title') or n.get('contract', {}).get('address', '?')[:10]}")
+            else:
+                lines.append("\nNo NFTs in this wallet.")
+        except Exception:
+            lines.append("(holdings index unavailable — balance above is live)")
+        return "\n".join(lines)
+
+    if chain not in OS_CHAINS:
+        return (f"❌ Unknown chain {chain!r}. Use: solana, all, or "
+                f"{', '.join(OS_CHAINS)} + robinhood.")
+    wallet = _load_wallet(chain)
+    if not wallet or not wallet.get("address"):
+        return (f"❌ No EVM wallet for {chain}. import_evm_wallet covers ALL "
+                "EVM chains with one key.")
+    addr = wallet["address"]
+
+    # native gas balance via best available RPC
+    bal = None
+    urls = ([alchemy_rpc(chain)] if alchemy_rpc(chain) else []) + list(OS_CHAINS[chain]["rpcs"])
+    for url in urls:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                url, data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                      "method": "eth_getBalance",
+                                      "params": [addr, "latest"]}).encode(),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 aesir-agent/1.0"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                bal = int(json.loads(r.read()).get("result", "0x0"), 16) / 1e18
+            break
+        except Exception:
+            continue
+    lines = [f"🖼️ {chain.title()} NFT wallet", f"{addr}"]
+    lines.append("ETH: {:.5f}".format(bal) if bal is not None else "Balance: RPC unreachable")
+
+    try:
+        from opensea_tools import opensea_holdings
+        holdings = opensea_holdings(chain, addr)
+        lines.append("")
+        lines.append(holdings)
+    except Exception as e:
+        lines.append(f"(holdings unavailable: {str(e)[:80]})")
     return "\n".join(lines)
 
 
@@ -651,40 +874,57 @@ def get_nft_portfolio(chain: str = "solana") -> str:
 # ============================================================
 
 def get_upcoming_mints(chain: str = "all") -> str:
-    """Get upcoming NFT mints across chains."""
-    # This would normally call an API like NFTCalendar or Mintpad
-    upcoming = {
-        "solana": [
-            ("Mad Lads S2", "madlads-s2", "TBD", "Metaplex Core"),
-            ("Tensor Drops", "tensor-drops", "Weekly", "Compressed"),
-        ],
-        "ethereum": [
-            ("Azuki Elementals 2", "azuki-e2", "TBD", "ERC-721"),
-            ("Pudgy Penguins Mobile", "pudgy-mobile", "Q1 2026", "ERC-721"),
-        ],
-        "base": [
-            ("Parallel Arena", "parallel-arena", "TBD", "ERC-721"),
-            ("Base Builders", "base-builders", "Monthly", "ERC-721"),
-        ],
-    }
-
-    lines = ["🔥 Upcoming NFT Mints\n"]
-    for c, mints in upcoming.items():
-        if chain != "all" and chain != c:
-            continue
-        lines.append(f"\n{c.title()}:")
-        for name, slug, date, standard in mints:
-            lines.append(f"• {name} — {date} ({standard})")
-
-    return "\n".join(lines)
+    """Upcoming/live NFT mints — real data from OpenSea's live drops API.
+    (Previously returned a hardcoded fake list; now delegates to the real
+    drop feeds, which cover ethereum/base/arbitrum/optimism/polygon.)"""
+    try:
+        from opensea_tools import opensea_drops
+        if chain and chain != "all":
+            return opensea_drops(chain=chain, drop_type="upcoming", limit=10)
+        parts = []
+        for dtype in ("featured", "upcoming", "recently_minted"):
+            parts.append(opensea_drops(drop_type=dtype, limit=6))
+        return "\n\n".join(parts)
+    except Exception as e:
+        return (f"❌ Live mint feed unavailable: {e}.\n"
+                "Note: Solana mints aren't on OpenSea drops — for Solana, watch "
+                "specific candy machines via watch_wallet instead.")
 
 
 # ============================================================
 # Wallet Management (for NFTs)
 # ============================================================
 
-def new_wallet(chain: str = "solana") -> str:
-    """Create a new wallet for NFT minting."""
+def new_wallet(chain: str = "solana", force: bool = False) -> str:
+    """Create a new wallet for NFT minting.
+
+    Refuses to overwrite an existing wallet unless force=True — a silent
+    regeneration would orphan any funds on the old key. For bringing in an
+    existing key use import_evm_wallet instead.
+    """
+    chain = (chain or "solana").lower().strip()
+    # Overwrite protection: existing wallets must never be silently replaced.
+    if not force:
+        existing = None
+        if chain == "solana" and SOLANA_WALLET_FILE.exists():
+            try:
+                existing = json.loads(SOLANA_WALLET_FILE.read_text())
+            except Exception:
+                existing = {"error": "unreadable"}
+        elif chain in ("ethereum", "base") and EVM_WALLET_FILE.exists():
+            try:
+                existing = json.loads(EVM_WALLET_FILE.read_text())
+            except Exception:
+                existing = {"error": "unreadable"}
+        if existing:
+            addr = existing.get("address") or existing.get("public_key") or "(unreadable)"
+            return (
+                f"⚠️ An {'EVM' if chain != 'solana' else 'Solana'} wallet already exists ({addr}). "
+                "Refusing to overwrite it — any funds on it would be orphaned.\n\n"
+                "• To use an existing key instead: import_evm_wallet(private_key=…)\n"
+                "• To genuinely discard it and generate a fresh wallet: "
+                "new_wallet(chain=…, force=true) — back up the old key first"
+            )
     if chain == "solana":
         wallet = _create_solana_wallet()
         if "error" in wallet:
@@ -726,19 +966,122 @@ def new_wallet(chain: str = "solana") -> str:
 # Tool Registry
 # ============================================================
 
+def transfer_nft(chain: str = "ethereum", contract: str = "", token_id: str = "",
+                 to_address: str = "") -> str:
+    """
+    REAL ERC-721 NFT transfer: signs safeTransferFrom with your EVM wallet
+    and broadcasts on-chain. Works on any chain with a verified RPC
+    (ethereum, base, robinhood). This is a wallet-to-wallet transfer, not a
+    marketplace sale.
+    """
+    chain = (chain or "").lower()
+    rpcs = {
+        "ethereum": ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+        "base": ["https://mainnet.base.org", "https://base-rpc.publicnode.com"],
+        "robinhood": ["https://rpc.mainnet.chain.robinhood.com"],
+    }
+    explorers = {
+        "ethereum": "https://etherscan.io/tx/{}",
+        "base": "https://basescan.org/tx/{}",
+        "robinhood": "https://robinhoodchain.blockscout.com/tx/{}",
+    }
+    if chain not in rpcs:
+        return f"❌ Chain {chain!r} not supported for NFT transfer. Use: {', '.join(rpcs)}"
+    if not contract.startswith("0x") or len(contract) != 42:
+        return "❌ Provide the NFT contract address (0x...)."
+    if not str(token_id).strip():
+        return "❌ Provide the token id."
+    if not to_address.startswith("0x") or len(to_address) != 42:
+        return "❌ Provide the recipient address (0x...)."
+
+    try:
+        from evm_swap import _load_wallet
+        wallet = _load_wallet("ethereum")  # same key on all EVM chains
+        if not wallet or not wallet.get("private_key"):
+            return "❌ No EVM wallet. Create one first."
+
+        from web3 import Web3
+        from evm_swap import alchemy_rpc
+        alt = alchemy_rpc(chain)
+        rpc_list = ([alt] if alt else []) + list(rpcs[chain])
+        w3 = None
+        for rpc in rpc_list:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, {"timeout": 15}))
+                if w3.is_connected():
+                    break
+            except Exception:
+                continue
+        if w3 is None:
+            return f"❌ All RPCs for {chain} unreachable."
+
+        account = w3.eth.account.from_key(wallet["private_key"])
+        nft = w3.eth.contract(
+            address=w3.to_checksum_address(contract),
+            abi=[
+                {"name": "safeTransferFrom", "type": "function", "stateMutability": "nonpayable",
+                 "inputs": [{"name": "from", "type": "address"}, {"name": "to", "type": "address"},
+                            {"name": "tokenId", "type": "uint256"}], "outputs": []},
+                {"name": "ownerOf", "type": "function", "stateMutability": "view",
+                 "inputs": [{"name": "tokenId", "type": "uint256"}], "outputs": [{"type": "address"}]},
+            ])
+        tid = int(token_id)
+
+        # Ownership check BEFORE signing anything
+        owner = nft.functions.ownerOf(tid).call()
+        if owner != account.address:
+            short = f"{owner[:8]}...{owner[-6:]}"
+            return (f"❌ You don't own token #{tid} in this collection — "
+                    f"on-chain owner is {short}. Refusing to transfer what you don't hold.")
+
+        tx = nft.functions.safeTransferFrom(
+            account.address, w3.to_checksum_address(to_address), tid
+        ).build_transaction({})
+        tx.update({"from": account.address,
+                   "nonce": w3.eth.get_transaction_count(account.address),
+                   "chainId": w3.eth.chain_id,
+                   "gasPrice": w3.eth.gas_price})
+        tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.2)
+        signed = w3.eth.account.sign_transaction(tx, account.key)
+        h = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(h, timeout=180)
+        ok = receipt.status == 1
+        link = explorers[chain].format(h.hex())
+        try:
+            import trade_journal
+            trade_journal.log_trade(
+                kind="nft_transfer", chain=chain, token=contract[:10] + "…",
+                token_addr=contract, amount=1, tx=h.hex(),
+                status="confirmed" if ok else "failed", note=f"#{tid} → {to_address}")
+        except Exception:
+            pass
+        if not ok:
+            return f"❌ Transfer REVERTED on-chain.\nTx: {link}"
+        return (f"✅ NFT transferred for real ({chain})\n\n"
+                f"Token #{tid} → `{to_address}`\nTx: {link}")
+    except ValueError:
+        return "❌ Invalid token id — must be a number."
+    except Exception as e:
+        return f"❌ Transfer failed: {e}"
+
+
 NFT_TOOLS = [
     {"type": "function", "function": {"name": "get_nft_floor", "description": "Get NFT collection floor price (live data).", "parameters": {"type": "object", "properties": {"collection": {"type": "string"}, "chain": {"type": "string", "enum": ["solana", "ethereum", "base", "robinhood"]}}, "required": ["collection"]}}},
-    {"type": "function", "function": {"name": "get_popular_nfts", "description": "List popular NFT collections by chain.", "parameters": {"type": "object", "properties": {"chain": {"type": "string", "enum": ["solana", "ethereum", "base", "robinhood"]}}}}},
+    {"type": "function", "function": {"name": "get_popular_nfts", "description": "LIVE trending NFT collections by chain (OpenSea, 24h volume). No hardcoded data.", "parameters": {"type": "object", "properties": {"chain": {"type": "string", "enum": ["solana", "ethereum", "base", "arbitrum", "optimism", "polygon", "robinhood"]}}}}},
     {"type": "function", "function": {"name": "mint_nft", "description": "Mint an NFT on any chain. Uses wallet keys to sign and broadcast transaction.", "parameters": {"type": "object", "properties": {"collection": {"type": "string", "description": "Contract address or collection name"}, "name": {"type": "string", "description": "NFT name"}, "chain": {"type": "string", "enum": ["solana", "ethereum", "base"]}, "image_url": {"type": "string", "description": "IPFS or Arweave URL"}, "symbol": {"type": "string"}}, "required": ["collection", "name"]}}},
-    {"type": "function", "function": {"name": "buy_nft", "description": "Buy an NFT from a collection via marketplace.", "parameters": {"type": "object", "properties": {"collection": {"type": "string"}, "chain": {"type": "string", "enum": ["solana", "ethereum", "base", "robinhood"]}, "max_price": {"type": "number"}}, "required": ["collection"]}}},
-    {"type": "function", "function": {"name": "sell_nft", "description": "List an NFT for sale on marketplace.", "parameters": {"type": "object", "properties": {"collection": {"type": "string"}, "token_id": {"type": "string"}, "chain": {"type": "string"}, "price": {"type": "number"}}, "required": ["collection"]}}},
+    {"type": "function", "function": {"name": "buy_nft", "description": "NFT buying info (floor, links). For REAL OpenSea purchases on ethereum/base/arbitrum/optimism/polygon use opensea_buy_nft instead — it executes on-chain.", "parameters": {"type": "object", "properties": {"collection": {"type": "string"}, "chain": {"type": "string", "enum": ["solana", "ethereum", "base", "robinhood"]}, "max_price": {"type": "number"}}, "required": ["collection"]}}},
+    {"type": "function", "function": {"name": "sell_nft", "description": "NFT listing info. For REAL OpenSea listings on EVM chains use opensea_list_nft instead — it executes on-chain.", "parameters": {"type": "object", "properties": {"collection": {"type": "string"}, "token_id": {"type": "string"}, "chain": {"type": "string"}, "price": {"type": "number"}}, "required": ["collection"]}}},
     {"type": "function", "function": {"name": "get_nft_portfolio", "description": "View NFT holdings across chains.", "parameters": {"type": "object", "properties": {"chain": {"type": "string", "enum": ["solana", "ethereum", "base", "robinhood"]}}}}},
-    {"type": "function", "function": {"name": "create_collection", "description": "Create a new NFT collection.", "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "symbol": {"type": "string"}, "chain": {"type": "string"}}, "required": ["name", "symbol"]}}},
+    {"type": "function", "function": {"name": "transfer_nft", "description": "REAL on-chain NFT transfer (ERC-721 safeTransferFrom) — signs with your wallet and broadcasts. Wallet-to-wallet transfer, not a marketplace sale. Chains: ethereum, base, robinhood.", "parameters": {"type": "object", "properties": {"chain": {"type": "string", "enum": ["ethereum", "base", "robinhood"]}, "contract": {"type": "string", "description": "NFT contract address (0x...)"}, "token_id": {"type": "string", "description": "Token id number"}, "to_address": {"type": "string", "description": "Recipient 0x address"}}, "required": ["chain", "contract", "token_id", "to_address"]}}},
+    {"type": "function", "function": {"name": "create_collection", "description": "Returns guidance on deploying an NFT collection (deployment is NOT yet executable from this bot — do not promise the user it will deploy anything).", "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "symbol": {"type": "string"}, "chain": {"type": "string"}}, "required": ["name", "symbol"]}}},
     {"type": "function", "function": {"name": "get_upcoming_mints", "description": "Get upcoming NFT mints across all chains.", "parameters": {"type": "object", "properties": {"chain": {"type": "string"}}}}},
-    {"type": "function", "function": {"name": "new_wallet", "description": "Create a new wallet for NFT minting on any chain.", "parameters": {"type": "object", "properties": {"chain": {"type": "string", "enum": ["solana", "ethereum", "base"]}}}}},
+    {"type": "function", "function": {"name": "new_wallet", "description": "Create a BRAND-NEW random wallet for NFT minting on any chain. Refuses to overwrite an existing wallet — use import_evm_wallet to bring an existing key in.", "parameters": {"type": "object", "properties": {"chain": {"type": "string", "enum": ["solana", "ethereum", "base"]}, "force": {"type": "boolean", "description": "Set true ONLY to deliberately discard an existing wallet and generate a fresh one"}}}}},
+    {"type": "function", "function": {"name": "import_evm_wallet", "description": "Import an EXISTING EVM wallet from a raw hex private key (64 hex chars, with or without 0x). Works on all EVM chains (ethereum, base, arbitrum, optimism, polygon, robinhood). Refuses to silently overwrite existing wallets — backs them up first. The key is stored locally and never displayed.", "parameters": {"type": "object", "properties": {"private_key": {"type": "string", "description": "Hex private key (0x optional)"}, "chain": {"type": "string", "description": "'all' (default) or a specific chain: ethereum, base, arbitrum, optimism, polygon, robinhood"}}, "required": ["private_key"]}}},
 ]
 
 NFT_TOOL_MAP = {
+    "transfer_nft": lambda a: transfer_nft(a.get("chain", "ethereum"), a["contract"],
+                                           a["token_id"], a["to_address"]),
     "get_nft_floor": lambda a: get_nft_floor(a["collection"], a.get("chain", "solana")),
     "get_popular_nfts": lambda a: get_popular_nfts(a.get("chain", "solana")),
     "mint_nft": lambda a: _dispatch_mint(a),
@@ -747,7 +1090,8 @@ NFT_TOOL_MAP = {
     "get_nft_portfolio": lambda a: get_nft_portfolio(a.get("chain", "solana")),
     "create_collection": lambda a: create_collection(a["name"], a["symbol"], a.get("chain", "solana")),
     "get_upcoming_mints": lambda a: get_upcoming_mints(a.get("chain", "all")),
-    "new_wallet": lambda a: new_wallet(a.get("chain", "solana")),
+    "new_wallet": lambda a: new_wallet(a.get("chain", "solana"), a.get("force", False)),
+    "import_evm_wallet": lambda a: import_evm_wallet(a["private_key"], a.get("chain", "all")),
 }
 
 

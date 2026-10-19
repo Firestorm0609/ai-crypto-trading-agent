@@ -101,7 +101,7 @@ def optimize_with_dspy():
     # Test on examples
     examples = get_training_examples()
     correct = 0
-    total = len(examples)
+    tested = min(10, len(examples))
 
     print("Testing current prompt on training examples...")
     for ex in examples[:10]:  # Test first 10
@@ -112,7 +112,7 @@ def optimize_with_dspy():
         except Exception:
             pass
 
-    accuracy = (correct / 10) * 100
+    accuracy = (correct / tested) * 100 if tested else 0.0
     print(f"Accuracy: {accuracy}%")
 
     return accuracy

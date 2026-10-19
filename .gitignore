@@ -2,6 +2,7 @@
 .env
 .env.*
 *.env
+.venv/
 
 # Python
 __pycache__/
@@ -24,6 +25,7 @@ build/
 # Data
 *.db
 *.sqlite
+data/
 agent_todos/
 .dspy_cache/
 wallets/
@@ -40,3 +42,11 @@ all_tools_restored.py
 # OS
 .DS_Store
 Thumbs.db
+.bot_instance.lock
+
+# Runtime / secrets
+.webhook_token
+bot.pid
+mint_queue.json
+toks_out.json
+watched_evm_wallets.json

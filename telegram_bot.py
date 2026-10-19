@@ -17,7 +17,9 @@ import json
 import logging
 import time
 import threading
-from typing import Optional
+import asyncio
+import base64
+from typing import Optional, Union
 from openai import OpenAI
 
 from telegram import Update, BotCommand
@@ -29,54 +31,193 @@ from telegram.ext import (
     filters,
 )
 
-from config import MISTRAL_API_KEYS, MISTRAL_MODEL
+from config import (MISTRAL_API_KEYS, MISTRAL_MODEL, XAI_API_KEY, XAI_MODEL,
+                    XAI_BASE_URL, AUTO_TRADE_LIVE, AUTO_TRADE_MAX_USD, TOOL_SCOPING)
 from prompt_manager import get_active_prompt
 from dspy_optimizer import load_optimized_prompt
-from all_tools import ALL_TOOLS, TOOL_MAP
+from registry import TOOLS as ALL_TOOLS, dispatch_tool, TOOL_MAP
+from tool_scoping import select_tools
+from guardrails import ActionTracker, review_reply, portfolio_check_message, TRADE_EXECUTION_TOOLS
 from solana_commands import (
     cmd_wallet, cmd_buytoken, cmd_selltoken,
     cmd_solprice, cmd_tokenprice, cmd_rugcheck, cmd_newwallet,
-    cmd_privatekey,
+    cmd_privatekey, cmd_importwallet,
 )
-from solana_tools import SOLANA_TOOLS, execute_solana_tool
-from multichain_tools import MULTICHAIN_TOOLS, MULTICHAIN_TOOL_MAP
-from robinhood_tools import ROBINHOOD_TOOLS, ROBINHOOD_TOOL_MAP
-from tokenized_stocks import STOCK_TOOLS, STOCK_TOOL_MAP
-from nft_tools import NFT_TOOLS, NFT_TOOL_MAP, new_wallet as _new_wallet, get_upcoming_mints as _get_upcoming_mints
-from auto_trading_rules import AUTO_TRADING_TOOLS, execute_auto_trading_tool, evaluate_rules as _evaluate_rules, _update_dca_last_buy
 from perps_tools import (
-    PERPS_TOOLS, PERPS_TOOL_MAP,
-    get_perps_platforms, get_perps_pairs, get_perps_quote,
-    get_perps_risk_guide, open_long as _open_long, open_short as _open_short,
-    close_position as _close_position_text,
+    get_perps_platforms, get_perps_pairs, get_perps_risk_guide,
     open_perps_position, close_perps_position, get_perps_positions,
-    get_perps_position,
 )
-from robinhood_mcp import RH_MCP_TOOLS, RH_MCP_TOOL_MAP
-from file_tools import FILE_TOOLS, execute_file_tool
+from auto_trading_rules import (
+    evaluate_rules as _evaluate_rules, _update_dca_last_buy,
+)
 from smolagents_agent import run_smolagents_query
 from multi_agent import run_multi_agent, get_framework_status, classify_task
-from super_tools import SUPER_TOOLS, SUPER_TOOL_MAP
-from uniswap_tools import UNISWAP_TOOLS, UNISWAP_TOOL_MAP
-from jupiter_tools import JUPITER_TOOLS, JUPITER_TOOL_MAP
-from swap_tools import SWAP_TOOLS, SWAP_TOOL_MAP
-from trend_scanner import TREND_TOOLS, TREND_TOOL_MAP
-from web_tools import WEB_TOOLS, WEB_TOOL_MAP
-from agent_tools import AGENT_TOOLS, AGENT_TOOL_MAP, suggest_followups as suggest_followups_tool
 from specialized_agents import create_orchestrator
-from full_agent_tools import FULL_AGENT_TOOLS, FULL_AGENT_TOOL_MAP
-from memory import MEMORY_TOOLS, MEMORY_TOOL_MAP, extract_memories, set_current_user
+from memory import extract_memories
 from features import (
     check_alerts, run_strategies, save_daily_snapshot,
     check_risk, get_stats, add_alert, get_alerts, cancel_alert,
     add_strategy, get_strategies, get_performance_chart,
-    get_fear_greed, get_crypto_news,
+    get_fear_greed, get_crypto_news, get_risk_status,
 )
 from trading_tools import (
     get_price, get_top_coins, get_portfolio,
     buy as paper_buy, sell as paper_sell,
     get_trade_history, reset_portfolio,
 )
+from solana_trader import (
+    buy_token as live_buy_token, sell_token as live_sell_token,
+    KNOWN_TOKENS as SOL_KNOWN_TOKENS,
+)
+from evm_swap import (
+    real_swap_execute as evm_swap_execute, CHAINS as EVM_CHAINS,
+    _load_wallet as _evm_load_wallet, _get_w3 as _evm_get_w3,
+    _resolve_token as _evm_resolve_token, _from_units as _evm_from_units,
+)
+from multichain_tools import KNOWN_EVM_TOKENS
+
+
+# ============================================================
+# Auto-trade execution router (paper → live lane)
+# ============================================================
+
+def _execute_autotrade(signal: dict) -> str:
+    """Execute one rule/strategy signal from the 60s auto-trade loop.
+
+    Paper by default. With AUTO_TRADE_LIVE=1 (owner-armed in .env), Solana-
+    executable signals route to the real Jupiter swap via buy_token/sell_token,
+    capped at AUTO_TRADE_MAX_USD per trade.
+
+    The live lane ONLY takes coins with a known Solana mint (SOL_KNOWN_TOKENS) —
+    the auto lane never guesses mints by name (impersonation risk), so unknown
+    symbols fall back to paper with a note. buy_token/sell_token keep their own
+    balance/liquidity/ambiguity refusals, which land in the Telegram message.
+    """
+    coin = (signal.get("coin") or "").upper()
+    action = (signal.get("action") or "").upper()
+
+    if not AUTO_TRADE_LIVE:
+        return _paper_autotrade(signal, "flag off")
+
+    if AUTO_TRADE_LIVE:
+        logger.info("Auto-trade: routing %s %s", action, coin or "?")
+        # EVM_lite first (ETH/native tokens live there); Solana next; else paper
+        route = _choose_route(coin, action)
+        if route == "sol":
+            return _live_sol_trade(signal, coin)
+        if route is not None:  # an EVM chain name
+            return _live_evm_trade(signal, coin, route)
+        return _paper_autotrade(signal, f"no known on-chain token for {coin or '?'} in live lane")
+    return _paper_autotrade(signal, "flag off")
+
+
+def _choose_route(coin: str, action: str):
+    """Pick the live lane for an auto-trade signal. Returns 'sol', an EVM
+    chain name (base/ethereum/robinhood), or None for paper.
+
+    Same rule as the Solana lane: ONLY coins with a known mint/contract
+    match — the auto lane never resolves by name (impersonation risk).
+    ETH/WETH live on EVM (base is the cheapest-gas chain); a BUY of ETH
+    isn't routable live (nothing to spend but ETH → not a live BUY target);
+    a SELL dumps native ETH into USDC. All other coins route by the Solana
+    mint map first, then the EVM token registry.
+    """
+    coin = (coin or "").upper()
+    if coin == "USDC":
+        return None  # never blind-buy the quote currency itself
+    if coin in ("ETH", "WETH"):
+        return None if action == "BUY" else "base"  # BUY ETH→USDC is the sensible live sell
+    if coin in SOL_KNOWN_TOKENS:
+        return "sol"
+    for chain in ("base", "ethereum", "robinhood"):
+        if coin in KNOWN_EVM_TOKENS.get(chain, {}):
+            return chain
+    return None
+
+
+def _live_sol_trade(signal: dict, coin: str, capped_desc: str = "") -> str:
+    """Real Jupiter swap from a rule/strategy signal (Solana lane).
+    BUYs spend SOL capped at AUTO_TRADE_MAX_USD; SELLs dump the signal's
+    percentage. Executor refusals (balance/liquidity/ambiguity) surface to
+    the user — never silently papered.
+    """
+    amount_usd = float(signal.get("amount_usd") or 0)
+    capped = min(amount_usd, AUTO_TRADE_MAX_USD) if amount_usd > 0 else None
+    cap_note = f" (capped ${amount_usd:.0f} → ${capped:.0f})" if (
+        capped is not None and capped < amount_usd) else ""
+
+    try:
+        if signal.get("action") == "BUY":
+            result = live_buy_token(coin, usd_amount=capped)
+        else:
+            result = live_sell_token(coin, percentage=float(signal.get("percentage") or 100))
+    except Exception as e:
+        result = f"❌ Live auto-trade error: {str(e)[:120]}"
+    return f"🔴 LIVE{cap_note}\n{result}"
+
+
+def _live_evm_trade(signal: dict, coin: str, chain: str) -> str:
+    """Real EVM swap from a rule/strategy signal. BUYs spend ETH (capped
+    in USD); SELLs dump the signal's percentage of the held token for ETH
+    (auto-unwrapped). Executor refusals surface to the user, no paper fallback
+    for partial state.
+    """
+    amount_usd = float(signal.get("amount_usd") or 0)
+    capped = min(amount_usd, AUTO_TRADE_MAX_USD) if amount_usd > 0 else None
+    cap_note = f" (capped ${amount_usd:.0f} → ${capped:.0f})" if (
+        capped is not None and capped < amount_usd) else ""
+
+    try:
+        if signal.get("action") == "BUY":
+            result = evm_swap_execute(chain, "ETH", coin.upper(),
+                                      amount=None, usd_amount=capped)
+        else:
+            pct = float(signal.get("percentage") or 100)
+            amount = _evm_sell_amount(chain, coin, pct)
+            result = evm_swap_execute(chain, coin.upper(), "ETH", amount=amount) if amount else (
+                f"❌ Wallet has no {coin.upper()} balance to sell on {chain}.")
+    except Exception as e:
+        result = f"❌ Live EVM auto-trade error: {str(e)[:120]}"
+    return f"🔴 LIVE EVM ({chain}){cap_note}\n{result}"
+
+
+def _evm_sell_amount(chain: str, coin: str, pct: float) -> float:
+    """Amount of `coin` owned on `chain` for a percentage SELL (0 = none)."""
+    try:
+        wallet = _evm_load_wallet(chain)
+        if not wallet or not wallet.get("private_key"):
+            return 0.0
+        w3 = _evm_get_w3(chain)
+        token = _evm_resolve_token(chain, coin.upper(), w3)
+        if token["native"]:
+            raw = w3.eth.get_balance(w3.eth.account.from_key(wallet["private_key"]).address)
+        else:
+            raw = w3.eth.contract(address=token["address"], abi=[
+                {"name": "balanceOf", "type": "function", "stateMutability": "view",
+                 "inputs": [{"name": "owner", "type": "address", "internalType": "address"}],
+                 "outputs": [{"type": "uint256", "internalType": "uint256"}]},
+            ]).functions.balanceOf(_evm_wcs(w3, wallet)).call()
+        held = _evm_from_units(raw, token)
+        held = max(0.0, held - 0.001 if token["native"] else held)  # keep gas
+        return held * min(pct, 100.0) / 100.0
+    except Exception:
+        return 0.0
+
+
+def _evm_wcs(w3, wallet):
+    return w3.eth.account.from_key(wallet["private_key"]).address
+
+
+def _paper_autotrade(signal: dict, why: str) -> str:
+    """Paper fallback for the auto-trade loop, with the reason shown."""
+    try:
+        if signal.get("action") == "BUY":
+            result = paper_buy(signal["coin"], signal["amount_usd"])
+        else:
+            result = paper_sell(signal["coin"], percentage=signal.get("percentage", 50))
+    except Exception as e:
+        result = f"❌ Paper trade error: {str(e)[:120]}"
+    return f"📄 PAPER ({why})\n{result}"
 
 # ============================================================
 # Logging
@@ -95,7 +236,36 @@ logger = logging.getLogger(__name__)
 # Load prompt from prompt manager (versioned, swappable)
 # Use: python3 prompt_manager.py use v3 to switch versions
 # Load prompt: DSPy optimized > prompt_manager > hardcoded fallback
-SYSTEM_PROMPT = load_optimized_prompt() or get_active_prompt()
+# Operational-honesty rules — appended at load time so DSPy prompt
+# regeneration can never drop them.
+SYSTEM_PROMPT = (load_optimized_prompt() or get_active_prompt()) + """
+
+OPERATIONAL HONESTY — how to report infrastructure problems:
+- Transient rate limits (429), key rotation, and brief retries are HANDLED AUTOMATICALLY by the system. If a call eventually succeeds, never mention the hiccup — just answer normally.
+- Only report an API/system problem if the final result genuinely failed or is incomplete, and then say exactly WHAT failed (which API, which step) and what the user can do (retry in a minute).
+- NEVER invent vague phrases like "API issues", "can't verify", "technical difficulties" when you have the data or the call succeeded. If you don't know, say what you don't know and which tool would tell you.
+- Never guess or fabricate prices, balances, or statuses. Use the tools; if a tool errors, report its actual error text briefly.
+- DATA PROVENANCE: every number you show (price, floor, supply, owners, balance) MUST come from a tool result in THIS conversation. If no tool call produced that number, you do not know it — call the tool. NEVER repeat collection stats from training memory (they are always stale or wrong). If a tool fails, say so and show its error.
+FULL TOOLSET — NEVER HOLD BACK (the rule the owner cares about most):
+- The COMPLETE tool registry is open to you on every call — trading, perps, NFTs, wallets, files, code, web, memory, automation. Nothing is gated.
+- Reach for ANY tool the moment it helps. Don't pre-filter, don't ask permission, don't say 'I don't have a tool for that' unless you checked and none fits — if unsure, TRY the most plausible tool and read the result.
+- Chain tool calls freely in one turn (check → verify → act). One call is rarely enough; do the whole job.
+- Answering from memory when a tool exists for the fact is a failure. Tools first, always.
+
+CHAIN KNOWLEDGE — get these right:
+- 'Robinhood chain' is an ETHEREUM LAYER-2 network — specifically an Arbitrum Orbit rollup, chainId 4663 (0x1237), explorer robinhoodchain.blockscout.com. It is NOT the Robinhood stock brokerage. It supports normal EVM things: ERC-20s, ERC-721/1155 NFTs, Uniswap V2/V3 swaps, direct contract mints. Every EVM tool accepts chain='robinhood' — just pass it like base or arbitrum. Do NOT redirect Robinhood-chain NFT/token questions to stock tools or say it's unsupported.
+- One EVM key works on ALL EVM chains (ethereum, base, arbitrum, optimism, polygon, robinhood). The wallet files are already synced per chain.
+- EVM NFTs are NOT Seaport-only: OpenSea drops and direct contract mints (scan_contract_mint → mint_contract) work on every chain above, robinhood included.
+- NFT collections are PER-CHAIN: 'hood-remilias' exists on robinhood, not ethereum. When a floor/holdings lookup returns not-found, retry with the other chains the user might mean (opensea_floor has a chain param) before saying a collection doesn't exist. Never silently report ethereum data for a collection the user asked about on another chain.
+- MONEY UNITS: when the user says '$20', '50 dollars', or any $ amount, that is USD — pass it as max_price_usd on NFT buys/mints, NEVER as max_price_eth. A $20 budget is 20 USD (~0.0085 ETH), not 20 ETH (~$47k). Only use max_price_eth when the user explicitly says 'ETH'.
+
+MONEY & BALANCES — NEVER FROM MEMORY (these are the rules you cannot break):
+1. Balance, portfolio total, USDC/ETH/token amounts: ONLY from get_evm_balance, get_multichain_portfolio, or get_wallet_balance called in THIS turn. No tool call = you do not know the number. Never compute it from a price × amount you remembered.
+2. A balance stated ANYWHERE earlier in this conversation (by you or the user) is EXPIRED. Re-query before using it in any money decision — funds move.
+3. Never invent requirements like 'you need USDC' or 'deposit more X'. What a pool trades against is a fact from the quote/swap tool, not from your head. If a buy failed, report the tool's actual error.
+4. If tool calls keep failing (429s, timeouts), say exactly that and stop. NEVER fall back to answering money questions from memory — a wrong balance is worse than no answer.
+5. Currency of a pool = what the quote tool says. ABCD-style robinhood pools are usually ETH/WETH-denominated; claiming USDC is required when the tool never said so is a fabrication.
+"""
 
 # Fallback if prompt manager fails
 if not SYSTEM_PROMPT:
@@ -143,37 +313,35 @@ WHEN FIXING CODE - THIS IS CRITICAL:
 3. You MUST use restart_bot tool to apply
 4. NEVER make up code. NEVER guess what the code looks like. ALWAYS use read_file first.
 5. NEVER ask permission - just do it. Use the tools immediately.
-6. The bot files are in /root/gemini-agent/
+6. The bot files are in /root/Aesir/ (physically /root/op/ai-crypto-trading-agent)
 7. Always explain what you changed after making the edit.
 8. If user says "fix" or "edit" or "modify" or "change" code, you MUST call read_file tool first."""
 
 
 # ============================================================
-# Mistral Key Rotator (primary provider)
+# LLM Key Rotator (xAI grok — primary; Mistral — fallback)
 # ============================================================
-# Groq keys are disabled but preserved in .env for future use
-# To re-enable: uncomment GROQ_API_KEY lines in .env
 
 
-class MistralKeyRotator:
-    def __init__(self, keys):
+class LLMKeyRotator:
+    def __init__(self, keys, base_url="https://api.mistral.ai/v1"):
         self.keys = keys
         self.current_index = 0
         self.key_usage = {i: {"requests": 0, "last_error": 0} for i in range(len(keys))}
-        self.base_url = "https://api.mistral.ai/v1"
+        self.base_url = base_url
 
     def get_client(self):
         if not self.keys:
             return None
         key = self.keys[self.current_index]
-        return OpenAI(api_key=key, base_url=self.base_url, max_retries=0, timeout=15.0)
+        return OpenAI(api_key=key, base_url=self.base_url, max_retries=0, timeout=60.0)
 
     def rotate(self, reason=""):
         if len(self.keys) <= 1:
             return False
         old_index = self.current_index
         self.current_index = (self.current_index + 1) % len(self.keys)
-        logger.info(f"Rotated Mistral key: {old_index} -> {self.current_index} ({reason})")
+        logger.info(f"Rotated LLM key: {old_index} -> {self.current_index} ({reason})")
         return True
 
     def mark_error(self):
@@ -189,36 +357,90 @@ class TradingAgent:
     def __init__(self):
         self.user_histories = {}
         
-        # Mistral only — simpler, more reliable, 1B tokens/month
-        if not MISTRAL_API_KEYS:
-            raise Exception("No Mistral API keys configured!")
-        
-        self.mistral_rotator = MistralKeyRotator(MISTRAL_API_KEYS)
-        logger.info(f"Initialized with {len(MISTRAL_API_KEYS)} Mistral keys")
+        # Main LLM: grok via xAI (owner's call 2026-10-15); Mistral stays as fallback
+        if XAI_API_KEY:
+            self.llm_rotator = LLMKeyRotator([XAI_API_KEY], XAI_BASE_URL)
+            self.llm_model = XAI_MODEL
+            logger.info(f"LLM provider: xAI grok ({XAI_MODEL})")
+        elif MISTRAL_API_KEYS:
+            self.llm_rotator = LLMKeyRotator(MISTRAL_API_KEYS)
+            self.llm_model = MISTRAL_MODEL
+            logger.info(f"LLM provider: Mistral ({len(MISTRAL_API_KEYS)} keys)")
+        else:
+            raise Exception("No LLM API keys configured! Add XAI_API_KEY (or MISTRAL_API_KEY) to .env")
         
         # Multi-agent orchestrator (Codebuff-style)
         self.orchestrator = create_orchestrator(
-            self.mistral_rotator.get_client(),
-            MISTRAL_MODEL
+            self.llm_rotator.get_client(),
+            self.llm_model
         )
         logger.info("Specialized agents initialized")
 
     def _clean_history(self, history):
-        """History cleanup with 1-sentence summary when truncating."""
+        """History cleanup with 1-sentence summary when truncating.
+        Boundary-safe: the kept slice never starts inside an
+        assistant(tool_calls)→tool block (Mistral rejects orphaned pieces)."""
         if len(history) <= 12:
             return
-        # Keep system prompt + last 10 messages
-        system = history[0]
-        kept = history[-10:]
-        # Build summary from messages being dropped
-        dropped = history[1:-10]
+        has_system = bool(history) and history[0].get("role") == "system"
+        system = history[0] if has_system else None
+        body = history[1:] if has_system else list(history)
+        cut = max(0, len(body) - 10)
+        # Never start the kept slice on a tool result — slide forward to the
+        # next assistant/user boundary (orphaned results are harmless;
+        # _sanitize_history repairs the call side if needed).
+        while cut < len(body) and body[cut].get("role") == "tool":
+            cut += 1
+        kept = body[cut:]
+        dropped = body[:cut]
         summary = self._summarize_dropped(dropped)
         history.clear()
-        history.append(system)
+        if system:
+            history.append(system)
         if summary:
             history.append({"role": "user", "content": f"[Previous context: {summary}]"})
         history.extend(kept)
         logger.info(f"History trimmed to {len(history)} messages with summary")
+
+    def _sanitize_history(self, history):
+        """Enforce Mistral's message-order invariants before every API call:
+        • every assistant tool_call must be followed by a tool result
+        • no tool result may appear without its assistant call preceding it
+        • nothing between the system prompt and the first real message
+        Repairs in place by synthesizing missing results and dropping
+        orphans — self-heals histories poisoned by earlier crashes."""
+        if not history:
+            return history
+        out = []
+        idx = 0
+        if history[0].get("role") == "system":
+            out.append(history[0])
+            idx = 1
+        while idx < len(history):
+            m = history[idx]
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+                results = {}
+                j = idx + 1
+                while j < len(history) and history[j].get("role") == "tool":
+                    results[history[j].get("tool_call_id")] = history[j]
+                    j += 1
+                out.append(m)
+                for tc_id in ids:
+                    if tc_id in results:
+                        out.append(results[tc_id])
+                    else:
+                        out.append({"role": "tool", "tool_call_id": tc_id,
+                                    "content": "(no result recorded — call was interrupted)"})
+                idx = j
+            elif role == "tool":
+                idx += 1  # orphan result — drop
+            else:
+                out.append(m)
+                idx += 1
+        history[:] = out
+        return history
 
     def _summarize_dropped(self, dropped_messages):
         """Extract key topics from dropped messages into a 1-sentence summary."""
@@ -228,7 +450,13 @@ class TradingAgent:
         for msg in dropped_messages:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
-                if content and len(content) > 5:
+                if isinstance(content, list):
+                    # Multimodal message (text + image parts) — keep only
+                    # the text parts so the summary never sees a list.
+                    text_parts = [p.get("text", "") for p in content
+                                  if isinstance(p, dict) and p.get("type") == "text"]
+                    content = " ".join(text_parts)
+                if isinstance(content, str) and content and len(content) > 5:
                     # Take first sentence or first 80 chars
                     first_sentence = content.split(".")[0].split("?")[0].split("!")[0].strip()
                     if first_sentence and len(first_sentence) > 10:
@@ -245,190 +473,89 @@ class TradingAgent:
         if user_id not in self.user_histories:
             self.user_histories[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
         history = self.user_histories[user_id]
-        # Keep system prompt + last 10 messages max (~5 turns)
         if len(history) > 12:
-            system = history[0]
-            kept = history[-10:]
-            # Summarize what we're dropping
-            dropped = history[1:-10]
-            summary = self._summarize_dropped(dropped)
-            history.clear()
-            history.append(system)
-            if summary:
-                history.append({"role": "user", "content": f"[Previous context: {summary}]"})
-            history.extend(kept)
-            self.user_histories[user_id] = history
-            logger.info(f"History loaded: {len(history)} messages (with summary)")
+            self._clean_history(history)
         return history
 
     def _get_tools(self):
-        # All tools — Groq may413 but will rotate to Mistral which handles larger payloads
-        return ALL_TOOLS + SOLANA_TOOLS + MULTICHAIN_TOOLS + ROBINHOOD_TOOLS + STOCK_TOOLS + NFT_TOOLS + PERPS_TOOLS + RH_MCP_TOOLS + FILE_TOOLS + AUTO_TRADING_TOOLS + SUPER_TOOLS + MEMORY_TOOLS + UNISWAP_TOOLS + JUPITER_TOOLS + SWAP_TOOLS + TREND_TOOLS + WEB_TOOLS + AGENT_TOOLS + FULL_AGENT_TOOLS
+        # All tools — see registry.py (single source of truth)
+        return ALL_TOOLS
 
     def _execute_tool(self, name, args):
-        # Solana tools
-        if name in ["generate_wallet", "get_wallet_balance", "get_sol_price",
-                    "get_token_price", "buy_token", "sell_token",
-                    "rug_check", "get_wallet_address"]:
-            return execute_solana_tool(name, args)
-        # Robinhood MCP tools
-        if name in RH_MCP_TOOL_MAP:
-            return RH_MCP_TOOL_MAP[name](args)
-        # NFT tools
-        if name in NFT_TOOL_MAP:
-            return NFT_TOOL_MAP[name](args)
-        # Perps tools
-        if name in PERPS_TOOL_MAP:
-            return PERPS_TOOL_MAP[name](args)
-        # Tokenized stocks
-        if name in STOCK_TOOL_MAP:
-            return STOCK_TOOL_MAP[name](args)
-        # Robinhood tools
-        if name in ROBINHOOD_TOOL_MAP:
-            return ROBINHOOD_TOOL_MAP[name](args)
-        # Multichain tools
-        if name in MULTICHAIN_TOOL_MAP:
-            return MULTICHAIN_TOOL_MAP[name](args)
-        # File tools (sandboxed)
-        if name in ["list_files", "read_file", "write_file", "edit_file", "run_safe_command", "restart_bot"]:
-            return execute_file_tool(name, args)
-        # Auto-trading rules
-        if name in ["add_trading_rule", "get_trading_rules", "cancel_trading_rule"]:
-            args["user_id"] = getattr(self, '_current_user_id', 0)
-            return execute_auto_trading_tool(name, args)
-        # Super tools (whale, scanner, sentiment, gas, etc.)
-        if name in SUPER_TOOL_MAP:
-            return SUPER_TOOL_MAP[name](args)
-        # Uniswap tools
-        if name in UNISWAP_TOOL_MAP:
-            return UNISWAP_TOOL_MAP[name](args)
-        # Jupiter tools
-        if name in JUPITER_TOOL_MAP:
-            return JUPITER_TOOL_MAP[name](args)
-        # Swap tools (real execution)
-        if name in SWAP_TOOL_MAP:
-            return SWAP_TOOL_MAP[name](args)
-        # Trend scanner tools
-        if name in TREND_TOOL_MAP:
-            return TREND_TOOL_MAP[name](args)
-        # Web access tools (GitHub, scrape, Twitter)
-        if name in WEB_TOOL_MAP:
-            return WEB_TOOL_MAP[name](args)
-        # Agent intelligence tools (plan, ask, suggest, verify)
-        if name in AGENT_TOOL_MAP:
-            args["user_id"] = getattr(self, '_current_user_id', 0)
-            return AGENT_TOOL_MAP[name](args)
-        # Full agent tools (read_url, code_search, git, etc.)
-        if name in FULL_AGENT_TOOL_MAP:
-            args["user_id"] = getattr(self, '_current_user_id', 0)
-            return FULL_AGENT_TOOL_MAP[name](args)
-        # Memory tools
-        if name in MEMORY_TOOL_MAP:
-            set_current_user(getattr(self, '_current_user_id', 0))
-            return MEMORY_TOOL_MAP[name](args)
-        # Paper trading + general tools
-        if name in TOOL_MAP:
-            return TOOL_MAP[name](args)
-        return f"Unknown tool: {name}"
+        # Unified dispatch — user scoping handled inside registry.dispatch_tool
+        return dispatch_tool(name, args, user_id=getattr(self, '_current_user_id', 0))
 
     def _call_llm(self, history, tools):
-        """Call Mistral with automatic key rotation."""
-        client = self.mistral_rotator.get_client()
-        if not client:
-            raise Exception("No Mistral keys available")
-        
-        try:
-            response = client.chat.completions.create(
-                model=MISTRAL_MODEL, messages=history, tools=tools,
-                tool_choice="auto", max_tokens=2000, temperature=0.7,
-                timeout=15.0,
-            )
-            self.mistral_rotator.key_usage[self.mistral_rotator.current_index]["requests"] += 1
-            return response
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "rate" in error_str.lower():
-                self.mistral_rotator.mark_error()
-                logger.warning("Mistral rate limited, rotating key...")
-                # Retry with next key
-                client = self.mistral_rotator.get_client()
-                if client:
-                    return client.chat.completions.create(
-                        model=MISTRAL_MODEL, messages=history, tools=tools,
-                        tool_choice="auto", max_tokens=2000, temperature=0.7,
-                        timeout=15.0,
-                    )
-            raise
-        last_error = None
-        for attempt in range(30):
-            for provider in self.providers:
-                try:
-                    if provider["type"] == "groq":
-                        client = self.groq_rotator.get_client()
-                        if not client:
-                            continue
-                        response = client.chat.completions.create(
-                            model=provider["model"], messages=history, tools=tools,
-                            tool_choice="auto", max_tokens=2000, temperature=0.7,
-                            timeout=10.0,
-                        )
-                        self.groq_rotator.key_usage[self.groq_rotator.current_index]["requests"] += 1
-                        return response
-                    elif provider["type"] == "mistral":
-                        client = self.mistral_rotator.get_client()
-                        if not client:
-                            continue
-                        response = client.chat.completions.create(
-                            model=provider["model"], messages=history, tools=tools,
-                            tool_choice="auto", max_tokens=2000, temperature=0.7,
-                            timeout=15.0,
-                        )
-                        self.mistral_rotator.key_usage[self.mistral_rotator.current_index]["requests"] += 1
-                        return response
-                    else:
-                        response = provider["client"].chat.completions.create(
-                            model=provider["model"], messages=history, tools=tools,
-                            tool_choice="auto", max_tokens=2000, temperature=0.7,
-                            timeout=15.0,
-                        )
-                        return response
-                except Exception as e:
-                    error_str = str(e)
-                    if "429" in error_str or "rate" in error_str.lower():
-                        if provider["type"] == "groq":
-                            self.groq_rotator.mark_error()
-                            logger.warning("Groq rate limited, rotating key...")
-                        elif provider["type"] == "mistral":
-                            self.mistral_rotator.mark_error()
-                            logger.warning("Mistral rate limited, rotating key...")
-                        continue
-                    last_error = e
-                    continue
-        raise Exception(f"All providers failed. Last: {last_error}")
+        """Call the active LLM (xAI grok, else Mistral) with key rotation.
+        Rotates to the next key on rate limits (429) and transient overloads (503).
+        """
+        transient_hints = ("429", "rate", "503", "high load", "temporarily unavailable", "overloaded", "timed out", "timeout")
 
-    async def handle_message(self, user_id: int, message: str) -> str:
+        if not self.llm_rotator.keys:
+            raise Exception("No LLM keys available")
+
+        last_error = None
+        for _ in range(len(self.llm_rotator.keys)):
+            client = self.llm_rotator.get_client()
+            if not client:
+                break
+            try:
+                response = client.chat.completions.create(
+                    model=self.llm_model, messages=self._sanitize_history(history), tools=tools,
+                    tool_choice="auto", max_tokens=2000, temperature=0.7,
+                    timeout=60.0,
+                )
+                self.llm_rotator.key_usage[self.llm_rotator.current_index]["requests"] += 1
+                return response
+            except Exception as e:
+                error_str = str(e).lower()
+                last_error = e
+                if any(hint in error_str for hint in transient_hints):
+                    self.llm_rotator.mark_error()
+                else:
+                    # Non-transient (auth, bad request, etc.) — don't burn other keys
+                    raise
+
+        if last_error:
+            raise last_error
+        raise Exception("No LLM keys available")
+
+    async def handle_message(self, user_id: int, message, image_b64: str = None, image_mime: str = "image/jpeg") -> str:
         # Set user ID for auto-trading rules
         self._current_user_id = user_id
-        
+
+        scope_text = message if isinstance(message, str) else ""
+        if image_b64 and not scope_text:
+            scope_text = "user sent an image"
+
         # Extract memories from user message
         try:
-            extract_memories(message, user_id)
+            if isinstance(message, str) and message:
+                extract_memories(message, user_id)
         except Exception:
             pass
-        
-        # Try multi-agent orchestrator first (Codebuff-style)
-        agent_result = self._handle_with_orchestrator(user_id, message)
-        if agent_result:
-            return agent_result
-        
-        # Fall back to single-agent approach
-        # No keyword hacking — the LLM decides when to use tools.
+
+        # Codebuff-style: tool scoping picks a small relevant subset, and
+        # the LLM itself decides when to delegate via the delegate tool.
         history = self._get_history(user_id)
-        history.append({"role": "user", "content": message})
-        tools = self._get_tools()
+        if image_b64:
+            caption = message if isinstance(message, str) and message.strip() else "Look at this image and tell me what you see. If it is a chart, token, wallet, or error, extract the useful details."
+            history.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": caption},
+                    {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
+                ],
+            })
+        else:
+            history.append({"role": "user", "content": message})
+        tools = select_tools(scope_text, ALL_TOOLS) if TOOL_SCOPING else ALL_TOOLS
+        tracker = ActionTracker()
+        rate_limited = False
         
         # Max steps — 30 is enough for any task
         max_steps = 30
+        last_exc_msg = ""
         
         for attempt in range(3):  # Up to 3 key rotations
             try:
@@ -438,7 +565,7 @@ class TradingAgent:
                     msg = response.choices[0].message
                     if not msg.tool_calls:
                         history.append({"role": "assistant", "content": msg.content or ""})
-                        return msg.content or "(No response)"
+                        return review_reply(tracker, msg.content or "(No response)")
                     
                     # Process tool calls
                     tool_calls_data = []
@@ -458,7 +585,20 @@ class TradingAgent:
                             tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
                         except json.JSONDecodeError:
                             tool_args = {}
-                        result = self._execute_tool(tool_name, tool_args)
+                        try:
+                            result = self._execute_tool(tool_name, tool_args)
+                        except Exception as tool_err:
+                            # Always answer every tool_call — an unanswered
+                            # assistant tool_calls block poisons the history
+                            # for Mistral (400 on every later turn).
+                            result = f"❌ Tool error: {str(tool_err)[:300]}"
+                        tracker.record(tool_name, tool_args, result)
+
+                        # After a real trade, attach fresh portfolio state
+                        # to the SAME tool result (Mistral rejects a bare
+                        # user message inserted after tool messages: 400)
+                        if tool_name in TRADE_EXECUTION_TOOLS:
+                            result = f"{result}\n\n{portfolio_check_message()}"
                         if len(result) > 600:
                             result = result[:600] + "... (truncated)"
                         history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -466,55 +606,44 @@ class TradingAgent:
                     try:
                         response = self._call_llm(history, tools)
                     except Exception as e:
-                        logger.warning(f"LLM call failed: {e}")
-                        self._clean_history(history)
-                        break
-                
-                return "(Max steps reached)"
+                        # Likely all keys rate-limited (429). Back off once
+                        # — per-minute quotas recover quickly — then retry.
+                        logger.warning(f"LLM call failed mid-task: {e}")
+                        rate_limited = True
+                        time.sleep(20)
+                        try:
+                            response = self._call_llm(history, tools)
+                            rate_limited = False
+                        except Exception as e2:
+                            logger.warning(f"Retry also failed: {e2}")
+                            self._clean_history(history)
+                            break
+                    
+                if rate_limited:
+                    return ("(The LLM key hit its rate limit mid-task — "
+                            "that task made a lot of AI calls. Wait ~1 minute and retry, "
+                            "or break the task into smaller pieces.)")
+                return "(Reached the step limit without finishing — try a smaller task.)"
             except Exception as e:
+                last_exc_msg = str(e)
                 logger.warning(f"Attempt {attempt + 1} failed: {e}")
                 self._clean_history(history)
                 continue
         
-        return "(All attempts failed)"
+        if "429" in last_exc_msg or "rate limit" in last_exc_msg.lower():
+            return ("The LLM is rate-limited right now — this is a "
+                    "quota problem, not a bug. Wait for the quota window to reset.")
+        return "(All attempts failed — try again shortly; if it persists, the logs have the details.)"
 
     def _handle_with_orchestrator(self, user_id: int, message: str) -> Optional[str]:
-        """Try to handle message with specialized agents."""
-        try:
-            tools = self._get_tools()
-            result = self.orchestrator.handle_message(message, tools, self._execute_tool_map)
-            # Fall back to main loop if orchestrator failed or hit max steps
-            if result and result != "(No response)" and "error" not in result.lower() and "max steps" not in result.lower():
-                return result
-        except Exception as e:
-            logger.warning(f"Orchestrator failed: {e}")
+        """Deprecated: kept for compatibility. Delegation is now LLM-driven
+        via the delegate tool, so the keyword orchestrator is not used."""
         return None
 
     @property
     def _execute_tool_map(self) -> dict:
-        """Build a merged tool map for the orchestrator."""
-        from all_tools import TOOL_MAP
-        from super_tools import SUPER_TOOL_MAP
-        from web_tools import WEB_TOOL_MAP
-        from trend_scanner import TREND_TOOL_MAP
-        from uniswap_tools import UNISWAP_TOOL_MAP
-        from jupiter_tools import JUPITER_TOOL_MAP
-        from swap_tools import SWAP_TOOL_MAP
-        from agent_tools import AGENT_TOOL_MAP
-        from memory import MEMORY_TOOL_MAP
-        
-        merged = {}
-        merged.update(TOOL_MAP)
-        merged.update(SUPER_TOOL_MAP)
-        merged.update(WEB_TOOL_MAP)
-        merged.update(TREND_TOOL_MAP)
-        merged.update(UNISWAP_TOOL_MAP)
-        merged.update(JUPITER_TOOL_MAP)
-        merged.update(SWAP_TOOL_MAP)
-        merged.update(AGENT_TOOL_MAP)
-        merged.update(FULL_AGENT_TOOL_MAP)
-        merged.update(MEMORY_TOOL_MAP)
-        return merged
+        """Merged tool map for the orchestrator — from the unified registry."""
+        return TOOL_MAP
 
 
 # ============================================================
@@ -550,10 +679,7 @@ def strategy_runner(bot):
             signals = run_strategies()
             for signal in signals:
                 try:
-                    if signal["action"] == "BUY":
-                        result = paper_buy(signal["coin"], signal["amount_usd"])
-                    else:
-                        result = paper_sell(signal["coin"], percentage=signal.get("percentage", 50))
+                    result = _execute_autotrade(signal)
 
                     text = (
                         f"🤖 Auto-Trade Executed\n\n"
@@ -570,10 +696,7 @@ def strategy_runner(bot):
             rule_signals = _evaluate_rules()
             for signal in rule_signals:
                 try:
-                    if signal["action"] == "BUY":
-                        result = paper_buy(signal["coin"], signal["amount_usd"])
-                    else:
-                        result = paper_sell(signal["coin"], percentage=signal.get("percentage", 50))
+                    result = _execute_autotrade(signal)
                     
                     # Update DCA last buy time if needed
                     if signal.get("_update_last_buy"):
@@ -613,13 +736,22 @@ agent = None
 application = None
 agent_mode = "function"  # "function", "smolagents", or "multi"
 
+ADMIN_USER_ID = 727210504  # owner — sensitive commands are restricted to this user
+
+
+def admin_only(func):
+    """Restrict a command to the bot owner's Telegram user ID."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user is None or update.effective_user.id != ADMIN_USER_ID:
+            await update.message.reply_text("🔒 This command is restricted to the bot owner.")
+            return
+        return await func(update, context)
+    return wrapper
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mistral_count = len(MISTRAL_API_KEYS)
     await update.message.reply_text(
         f"🤖 *Trading Agent Bot*\n\n"
-        f"Providers: Groq ({mistral_count} keys) + OpenRouter\n"
-        f"Auto-failover & key rotation enabled!\n\n"
         "*Quick Commands:*\n"
         "/portfolio — View holdings\n"
         "/price BTC — Check price\n"
@@ -644,6 +776,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from trading_tools import get_portfolio
     await update.message.reply_text(get_portfolio())
+
+
+async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/trades [chain|kind] — recent REAL executed actions from the journal."""
+    from trade_journal import recent
+    arg = (context.args[0].lower() if context.args else "")
+    chains = {"solana", "ethereum", "base", "robinhood", "arbitrum",
+              "optimism", "polygon"}
+    kinds = {"swap", "copy", "mint", "nft_buy", "nft_sell", "nft_list",
+             "nft_transfer", "bridge", "allowance"}
+    if arg in chains:
+        await update.message.reply_text(recent(20, chain=arg))
+    elif arg in kinds:
+        await update.message.reply_text(recent(20, kind=arg))
+    else:
+        await update.message.reply_text(recent(20))
 
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,9 +951,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/trades — History\n"
         "/stats — Analytics\n"
         "/chart — Performance\n\n"
-        "🔴 REAL Trading (Solana):\n"
-        "/wallet — View wallet\n"
-        "/buytoken WIF 0.5 — Buy with SOL\n"
+        "🔴 REAL Trading (Solana + EVM):\n"
+        "/wallet — All wallets: Solana + EVM balances\n"
+        "/buytoken WIF 0.5 — Buy with SOL (Jupiter)\n"
         "/selltoken WIF — Sell for SOL\n"
         "/solprice — SOL price\n"
         "/tokenprice WIF — Token price\n"
@@ -821,7 +969,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🖼️ NFTs:\n"
         "/nftwallet solana — Create/view NFT wallet\n"
         "/mintnft CONTRACT NAME chain — Mint NFT\n"
-        "/upcomingmints — Upcoming NFT drops\n\n"
+        "/upcomingmints — Upcoming NFT drops\n"
+        "/launches on/off [pumpfun/pons/all] — Graduation radar\n\n"
         "🔔 Alerts:\n"
         "/alert COIN above/below PRICE\n"
         "/alerts — List alerts\n"
@@ -830,12 +979,85 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/fear — Fear & Greed\n"
         "/news COIN — News\n"
         "/risk — Risk status\n\n"
+        "🩺 System:\n"
+        "run_self_check — Health of all APIs\n"
+        "list_api_keys — Keys (masked)\n"
+        "set_api_key(helius, NEW_KEY) — swap an exhausted\nkey instantly, validated first\n\n"
         "💬 Or chat naturally!",
     )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download a photo the owner sent and let Grok read it."""
+    global agent_mode
+    if update.effective_user is None or update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("\U0001f512 This bot is private.")
+        return
+    if not agent_mode or not agent:
+        await update.message.reply_text("Agent is off. /agent to turn it on.")
+        return
+
+    await update.message.chat.send_action("typing")
+    try:
+        if update.message.photo:
+            # Legacy/photo message — pick the largest size
+            photo = update.message.photo[-1]
+            media_mime = "image/jpeg"
+        else:
+            doc = update.message.document
+            if doc is None:
+                await update.message.reply_text("\u26a0\ufe0f That message has no image I can read.")
+                return
+            # Screenshots arrive as documents; check size before download
+            if doc.file_size and doc.file_size > 8_000_000:
+                await update.message.reply_text("\u26a0\ufe0f Image is over 8MB. Send a smaller one.")
+                return
+            media_mime = doc.mime_type or "image/png"
+            photo = doc
+        tg_file = await photo.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+        if len(raw) > 8_000_000:
+            await update.message.reply_text("\u26a0\ufe0f Image is over 8MB. Send a smaller one.")
+            return
+        b64 = base64.b64encode(raw).decode()
+        caption = (update.message.caption or "").strip()
+        reply = await agent.handle_message(
+            update.effective_user.id,
+            caption,
+            image_b64=b64,
+            image_mime=media_mime,
+        )
+    except Exception as e:
+        logger.exception("photo handler failed")
+        reply = f"\u26a0\ufe0f Could not read that image: {e}"
+
+    if len(reply) > 4000:
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i+4000])
+    else:
+        await update.message.reply_text(reply)
+
+
+async def _global_error_handler(update, context):
+    """Last-resort error net: log the exception and TELL the owner, so a
+    failing handler is never mistaken for 'typing & silence'."""
+    logger.exception("unhandled update error")
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                f"\u26a0\ufe0f Internal error: {context.error}"
+            )
+    except Exception:
+        pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global agent_mode
+    # Private bot: only the owner may talk to the agent (it has wallet,
+    # trading and file access — strangers must never reach it).
+    if update.effective_user is None or update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("🔒 Private bot — access is restricted to the owner.")
+        return
     user_id = update.effective_user.id
     message = update.message.text
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -879,35 +1101,82 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
+    # Full menu — mirrors every registered CommandHandler (42 unique).
+    # Keep in sync when adding commands.
     await application.bot.set_my_commands([
         BotCommand("start", "Welcome"),
+        BotCommand("help", "Show all commands"),
         BotCommand("portfolio", "View holdings"),
+        BotCommand("trades", "Real on-chain trade journal"),
         BotCommand("price", "Check price"),
         BotCommand("top", "Top 10 coins"),
-        BotCommand("buy", "Buy crypto"),
-        BotCommand("sell", "Sell crypto"),
-        BotCommand("trades", "Trade history"),
-        BotCommand("stats", "Portfolio analytics"),
         BotCommand("chart", "Performance chart"),
-        BotCommand("alert", "Set price alert"),
-        BotCommand("alerts", "View alerts"),
+        BotCommand("stats", "Portfolio analytics"),
         BotCommand("fear", "Fear & Greed Index"),
         BotCommand("news", "Crypto news"),
+        BotCommand("search", "Search web"),
+        # Market / paper trading
+        BotCommand("buy", "Buy crypto (paper)"),
+        BotCommand("sell", "Sell crypto (paper)"),
+        BotCommand("alert", "Set price alert"),
+        BotCommand("alerts", "View alerts"),
+        BotCommand("cancelalert", "Cancel alert by ID"),
+        # Auto-trading rules
         BotCommand("strategy", "Auto-trading"),
         BotCommand("strategies", "List strategies"),
-        BotCommand("risk", "Risk status"),
-        BotCommand("wallet", "Solana wallet"),
-        BotCommand("buytoken", "Buy token (REAL)"),
-        BotCommand("selltoken", "Sell token (REAL)"),
+        BotCommand("addrule", "Add rule: buy btc if it drops 5%"),
+        BotCommand("rules", "List active rules"),
+        BotCommand("cancelrule", "Cancel rule by ID"),
+        BotCommand("risk", "Risk dashboard"),
+        # Solana + EVM — real trading
+        BotCommand("wallet", "All wallets: Solana + EVM balances"),
+        BotCommand("buytoken", "Buy token with SOL (Jupiter, REAL)"),
+        BotCommand("selltoken", "Sell token for SOL (Jupiter, REAL)"),
         BotCommand("solprice", "SOL price"),
         BotCommand("tokenprice", "Token price"),
-        BotCommand("rugcheck", "Rug check"),
-        BotCommand("newwallet", "New wallet"),
-        BotCommand("reset", "Reset portfolio"),
+        BotCommand("rugcheck", "RugCheck.xyz report (REAL)"),
+        BotCommand("newwallet", "New wallet (refuses overwrite)"),
+        BotCommand("importwallet", "Import Solana key (Phantom/CLI/seed)"),
+        BotCommand("privatekey", "Show private key"),
+        # NFTs
+        BotCommand("nftwallet", "NFT wallets + real holdings (all chains)"),
+        BotCommand("mintnft", "Mint NFT on any chain"),
+        BotCommand("upcomingmints", "Live mint drops (OpenSea)"),
+        BotCommand("launches", "Graduation radar (pump.fun + Pons)"),
+        # Perps
+        BotCommand("perp", "Perps overview"),
+        BotCommand("perps", "Perps markets"),
+        BotCommand("perpslong", "Open long"),
+        BotCommand("perpsshort", "Open short"),
+        BotCommand("perpsclose", "Close position"),
+        BotCommand("perpspositions", "Open positions"),
+        BotCommand("perpsrisk", "Perps risk"),
+        # System
         BotCommand("agent", "Switch AI mode (function/smolagents/multi)"),
         BotCommand("agentstatus", "Show AI frameworks status"),
-        BotCommand("help", "Show commands"),
+        BotCommand("reset", "Reset paper portfolio"),
     ])
+    # Background pingers (copytrade alerts, mint watcher) must schedule onto
+    # THIS loop — PTB v20 Application has no .loop attribute.
+    _bot_loop = asyncio.get_running_loop()
+    try:
+        import copytrade as _ct
+        import evm_copytrade as _ect
+        _ct.BOT_LOOP = _bot_loop
+        _ect.BOT_LOOP = _bot_loop
+        import launch_watcher as _lw
+        _lw.BOT_LOOP = _bot_loop
+        _lw.set_bot(application, ADMIN_USER_ID)  # starts the watcher thread
+    except Exception as _e:
+        logger.warning(f"launch watcher wiring failed: {_e}")
+    # Dependency self-check: silent heartbeat, Telegram alert only when a
+    # dependency flips up→down or down→up.
+    try:
+        import self_check as _sc
+        _sc.set_notifier(_ct._ping if '_ct' in dir() else None)
+        _sc.start_scheduler()
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1038,20 +1307,14 @@ async def cmd_cancelrule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def cmd_nftwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create or view NFT wallet: /nftwallet solana"""
-    from nft_tools import new_wallet as _new_wallet
-    chain = context.args[0].lower() if context.args else "solana"
-    if chain not in ("solana", "ethereum", "base"):
-        await update.message.reply_text("Usage: /nftwallet solana|ethereum|base")
-        return
-    # If wallet exists, show portfolio
+    """Show NFT wallet + REAL holdings: /nftwallet [chain|all]"""
     from nft_tools import get_nft_portfolio
-    from pathlib import Path
-    wallet_file = Path(__file__).parent / "wallets" / f"{chain}_wallet.json" if chain != "solana" else Path(__file__).parent / "wallets" / "solana_wallet.json"
-    if wallet_file.exists():
-        await update.message.reply_text(get_nft_portfolio(chain))
-    else:
-        await update.message.reply_text(_new_wallet(chain))
+    chain = (context.args[0].lower() if context.args else "all")
+    valid = ("solana", "all", "ethereum", "base", "robinhood", "arbitrum", "optimism", "polygon")
+    if chain not in valid:
+        await update.message.reply_text(f"Usage: /nftwallet [{'|'.join(valid)}]")
+        return
+    await update.message.reply_text(get_nft_portfolio(chain))
 
 
 async def cmd_mintnft(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1080,6 +1343,22 @@ async def cmd_upcomingmints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from nft_tools import get_upcoming_mints
     chain = context.args[0] if context.args else "all"
     await update.message.reply_text(get_upcoming_mints(chain))
+
+
+# ============================================================
+# Launch Watcher (Pools.trade on Robinhood chain)
+# ============================================================
+
+async def cmd_launches(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Launch radar status, or toggle pads: /launches on <pad…|all> / off."""
+    import launch_watcher
+    args = [a.lower() for a in (context.args or [])]
+    if args and args[0] in ("on", "off"):
+        on = args[0] == "on"
+        pads = args[1:]
+        await update.message.reply_text(launch_watcher.set_pads(on, pads))
+        return
+    await update.message.reply_text(launch_watcher.status_text())
 
 
 # ============================================================
@@ -1123,6 +1402,12 @@ async def cmd_agent_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global TELEGRAM_TOKEN, agent, application
 
+    # Kernel-level single-instance lock. Every launch path (main.py,
+    # screen -dmS, tmux, direct run) goes through here — a second poller
+    # is now impossible; duplicates exit instantly with a clear message.
+    import instance_guard
+    instance_guard.ensure_single_instance()
+
     from pathlib import Path
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
@@ -1152,55 +1437,82 @@ def main():
     )
     application = app
 
+    # Private chats only: drop group/channel updates before any handler runs.
+    # (ContextTypes has no private_only kwarg in PTB v22 — this gate is the
+    # supported way; raising ApplicationHandlerStop skips all later groups.)
+    from telegram.ext import TypeHandler, ApplicationHandlerStop
+
+    async def _private_only_gate(update, context):
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None and chat.type != "private":
+            raise ApplicationHandlerStop
+
+    app.add_handler(TypeHandler(Update, _private_only_gate), group=-1)
+
+    # Give the copytrade modules the live bot handle for Telegram pings
+    try:
+        import copytrade as _ct
+        _ct.set_bot(app, ADMIN_USER_ID)
+        import evm_copytrade as _ect
+        _ect.set_bot(app, ADMIN_USER_ID)
+    except Exception as _e:
+        logger.warning(f"copytrade wiring failed: {_e}")
+
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("top", cmd_top))
-    app.add_handler(CommandHandler("buy", cmd_buy))
-    app.add_handler(CommandHandler("sell", cmd_sell))
-    app.add_handler(CommandHandler("trades", cmd_trades))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("chart", cmd_chart))
-    app.add_handler(CommandHandler("alert", cmd_alert))
-    app.add_handler(CommandHandler("alerts", cmd_alerts))
-    app.add_handler(CommandHandler("cancelalert", cmd_cancel_alert))
+    app.add_handler(CommandHandler("portfolio", admin_only(cmd_portfolio)))
+    app.add_handler(CommandHandler("price", admin_only(cmd_price)))
+    app.add_handler(CommandHandler("top", admin_only(cmd_top)))
+    app.add_handler(CommandHandler("buy", admin_only(cmd_buy)))
+    app.add_handler(CommandHandler("sell", admin_only(cmd_sell)))
+    app.add_handler(CommandHandler("trades", admin_only(cmd_trades)))
+    app.add_handler(CommandHandler("stats", admin_only(cmd_stats)))
+    app.add_handler(CommandHandler("chart", admin_only(cmd_chart)))
+    app.add_handler(CommandHandler("alert", admin_only(cmd_alert)))
+    app.add_handler(CommandHandler("alerts", admin_only(cmd_alerts)))
+    app.add_handler(CommandHandler("cancelalert", admin_only(cmd_cancel_alert)))
     app.add_handler(CommandHandler("fear", cmd_fear))
-    app.add_handler(CommandHandler("news", cmd_news))
-    app.add_handler(CommandHandler("risk", cmd_risk))
-    app.add_handler(CommandHandler("strategy", cmd_strategy))
-    app.add_handler(CommandHandler("strategies", cmd_strategies))
+    app.add_handler(CommandHandler("news", admin_only(cmd_news)))
+    app.add_handler(CommandHandler("risk", admin_only(cmd_risk)))
+    app.add_handler(CommandHandler("strategy", admin_only(cmd_strategy)))
+    app.add_handler(CommandHandler("strategies", admin_only(cmd_strategies)))
     # Perps / leverage commands
-    app.add_handler(CommandHandler("perps", cmd_perps))
-    app.add_handler(CommandHandler("perpslong", cmd_perps_long))
-    app.add_handler(CommandHandler("perpsshort", cmd_perps_short))
-    app.add_handler(CommandHandler("perpsclose", cmd_perps_close))
-    app.add_handler(CommandHandler("perpspositions", cmd_perps_positions))
-    app.add_handler(CommandHandler("perpsrisk", cmd_perps_risk))
-    app.add_handler(CommandHandler("perp", cmd_perps))
+    app.add_handler(CommandHandler("perps", admin_only(cmd_perps)))
+    app.add_handler(CommandHandler("perpslong", admin_only(cmd_perps_long)))
+    app.add_handler(CommandHandler("perpsshort", admin_only(cmd_perps_short)))
+    app.add_handler(CommandHandler("perpsclose", admin_only(cmd_perps_close)))
+    app.add_handler(CommandHandler("perpspositions", admin_only(cmd_perps_positions)))
+    app.add_handler(CommandHandler("perpsrisk", admin_only(cmd_perps_risk)))
+    app.add_handler(CommandHandler("perp", admin_only(cmd_perps)))
     # Auto-trading rules
-    app.add_handler(CommandHandler("rules", cmd_rules))
-    app.add_handler(CommandHandler("addrule", cmd_addrule))
-    app.add_handler(CommandHandler("cancelrule", cmd_cancelrule))
+    app.add_handler(CommandHandler("rules", admin_only(cmd_rules)))
+    app.add_handler(CommandHandler("addrule", admin_only(cmd_addrule)))
+    app.add_handler(CommandHandler("cancelrule", admin_only(cmd_cancelrule)))
     # NFT commands
-    app.add_handler(CommandHandler("nftwallet", cmd_nftwallet))
-    app.add_handler(CommandHandler("mintnft", cmd_mintnft))
-    app.add_handler(CommandHandler("upcomingmints", cmd_upcomingmints))
-    app.add_handler(CommandHandler("agent", cmd_agent))
+    app.add_handler(CommandHandler("nftwallet", admin_only(cmd_nftwallet)))
+    app.add_handler(CommandHandler("mintnft", admin_only(cmd_mintnft)))
+    app.add_handler(CommandHandler("upcomingmints", admin_only(cmd_upcomingmints)))
+    app.add_handler(CommandHandler("launches", admin_only(cmd_launches)))
+    app.add_handler(CommandHandler("agent", admin_only(cmd_agent)))
     app.add_handler(CommandHandler("agentstatus", cmd_agent_status))
-    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("reset", admin_only(cmd_reset)))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("search", admin_only(cmd_search)))
     # Solana trading commands
-    app.add_handler(CommandHandler("wallet", cmd_wallet))
-    app.add_handler(CommandHandler("buytoken", cmd_buytoken))
-    app.add_handler(CommandHandler("selltoken", cmd_selltoken))
-    app.add_handler(CommandHandler("solprice", cmd_solprice))
-    app.add_handler(CommandHandler("tokenprice", cmd_tokenprice))
-    app.add_handler(CommandHandler("rugcheck", cmd_rugcheck))
-    app.add_handler(CommandHandler("newwallet", cmd_newwallet))
-    app.add_handler(CommandHandler("privatekey", cmd_privatekey))
+    app.add_handler(CommandHandler("wallet", admin_only(cmd_wallet)))
+    app.add_handler(CommandHandler("buytoken", admin_only(cmd_buytoken)))
+    app.add_handler(CommandHandler("selltoken", admin_only(cmd_selltoken)))
+    app.add_handler(CommandHandler("solprice", admin_only(cmd_solprice)))
+    app.add_handler(CommandHandler("tokenprice", admin_only(cmd_tokenprice)))
+    app.add_handler(CommandHandler("rugcheck", admin_only(cmd_rugcheck)))
+    app.add_handler(CommandHandler("newwallet", admin_only(cmd_newwallet)))
+    app.add_handler(CommandHandler("importwallet", admin_only(cmd_importwallet)))
+    app.add_handler(CommandHandler("privatekey", admin_only(cmd_privatekey)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.IMAGE, handle_photo
+    ))
+    app.add_error_handler(_global_error_handler)
 
     # Start background workers
     bot = app.bot
@@ -1208,11 +1520,15 @@ def main():
     threading.Thread(target=strategy_runner, args=(bot,), daemon=True).start()
     threading.Thread(target=daily_snapshot, daemon=True).start()
 
-    mistral_count = len(MISTRAL_API_KEYS)
+    # LLM provider summary — xAI grok when set, else Mistral fallback
+    xai_count = 1 if XAI_API_KEY else 0
     print("=" * 50)
     print("  🤖 Trading Agent Bot (Full Feature Set)")
     print("=" * 50)
-    print(f"  Provider: Mistral ({len(MISTRAL_API_KEYS)} keys)")
+    if xai_count:
+        print(f"  Provider: xAI grok ({XAI_MODEL})")
+    else:
+        print(f"  Provider: Mistral ({len(MISTRAL_API_KEYS)} keys)")
     print(f"  Features: Alerts, Stats, Strategies, News, Fear/Greed, Risk")
     print(f"  Background: Alert checker, Strategy runner, Daily snapshots")
     print(f"  Press Ctrl+C to stop\n")

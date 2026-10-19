@@ -12,6 +12,10 @@ import json
 from pathlib import Path
 from datetime import datetime
 
+# Project root resolved from this file's location — survives renames of
+# the symlink you use to open the project (e.g. gemini-agent → Aesir).
+PROJECT_DIR = str(Path(__file__).resolve().parent)
+
 PLANS_DIR = Path(__file__).parent / "agent_plans"
 PLANS_DIR.mkdir(exist_ok=True)
 
@@ -277,7 +281,7 @@ def code_search(pattern: str, file_types: list = None, limit: int = 20) -> str:
         
         result = subprocess.run(
             cmd,
-            cwd="/root/gemini-agent",
+            cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
             timeout=10
@@ -335,7 +339,7 @@ def multi_file_edit(edits: list) -> str:
             continue
         
         try:
-            full_path = f"/root/gemini-agent/{filepath}"
+            full_path = f"{PROJECT_DIR}/{filepath}"
             with open(full_path, "r") as f:
                 content = f.read()
             
@@ -360,7 +364,7 @@ def batch_read_files(files: list) -> str:
     
     for filepath in files:
         try:
-            full_path = f"/root/gemini-agent/{filepath}"
+            full_path = f"{PROJECT_DIR}/{filepath}"
             with open(full_path, "r") as f:
                 content = f.read()
             

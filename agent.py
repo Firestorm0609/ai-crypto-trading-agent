@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Gemini AI Agent — a free-tier agent with tool-calling capabilities.
+CLI Agent — Mistral function-calling agent over the unified tool registry.
 
 Usage:
     python3 agent.py              # Interactive mode
     python3 agent.py "your task"  # Single task mode
+
+(For the Telegram bot, run telegram_bot.py. For the smolagents
+code-writing agent, run smolagents_agent.py.)
 """
 
 import sys
 import json
-from smolagents import Agent
 
-from config import MAX_AGENT_STEPS
-from all_tools import TOOLS
+from openai import OpenAI
+
+from config import (MISTRAL_API_KEYS, MISTRAL_MODEL, MAX_AGENT_STEPS,
+                    XAI_API_KEY, XAI_MODEL, XAI_BASE_URL, TOOL_SCOPING)
+from registry import TOOLS, dispatch_tool
+from tool_scoping import select_tools
+from guardrails import ActionTracker, review_reply
 
 
 # ============================================================
@@ -23,9 +30,10 @@ SYSTEM_PROMPT = """You are a capable AI assistant with access to tools.
 
 You can:
 - Search the web and fetch web pages
-- Read, write, and list files
-- Execute Python code
-- Run shell commands
+- Trade crypto (paper and real swaps), scan tokens, check prices
+- Read, write, and edit files
+- Run shell commands and Python code
+- Remember user preferences
 
 RULES:
 1. Always think step by step before acting.
@@ -33,111 +41,99 @@ RULES:
 3. If a tool fails, try a different approach.
 4. When you're done, give a clear final answer.
 5. Never run destructive commands without asking first.
-6. Keep file writes within the workspace.
-7. For web searches, try to be specific with your queries.
-8. When writing code, test it with run_python before telling the user it's done."""
+6. Confirm with the user before executing real trades."""
 
 
 # ============================================================
 # Agent Core
 # ============================================================
 
-class Agent:
+class CLIAgent:
+    """Simple function-calling agent loop for terminal use."""
+
     def __init__(self):
-        self.mode = "Standard"
-        self.status = "Active"
-        
-    def show_agent_status(self):
-        return f"🤖 Status: {self.status}"
-        
-    def show_mode(self):
-        return f"🎯 Mode: {self.mode}"
-        if not GEMINI_API_KEY:
-            print("Error: GEMINI_API_KEY not set!")
-            print("   Get one free at: https://aistudio.google.com/apikey")
-            print("   Then add it to the .env file.")
+        if XAI_API_KEY:
+            # Main LLM: grok via xAI (owner's call 2026-10-15)
+            self.client = OpenAI(
+                api_key=XAI_API_KEY,
+                base_url=XAI_BASE_URL,
+            )
+            self.model = XAI_MODEL
+        elif MISTRAL_API_KEYS:
+            self.client = OpenAI(
+                api_key=MISTRAL_API_KEYS[0],
+                base_url="https://api.mistral.ai/v1",
+            )
+            self.model = MISTRAL_MODEL
+        else:
+            print("Error: no LLM key set! Add XAI_API_KEY (or MISTRAL_API_KEY) to .env.")
             sys.exit(1)
+        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        genai.configure(api_key=GEMINI_API_KEY)
-
-        # TOOLS is already a list of FunctionDeclaration objects
-        tools = [Tool(function_declarations=TOOLS)]
-
-        # Configure model with tools
-        self.model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            system_instruction=SYSTEM_PROMPT,
-            tools=tools,
-        )
-
-        self.chat = self.model.start_chat(history=[])
-        self.step_count = 0
-
-    def run(self, user_message: str) -> str:
+    def run(self, user_message: str, verbose: bool = True) -> str:
         """Run the agent loop: send message -> handle tool calls -> repeat."""
-        self.step_count = 0
+        self.history.append({"role": "user", "content": user_message})
 
-        try:
-            self.chat.send_message(user_message)
-        except Exception as e:
-            return f"Error sending message: {str(e)}"
+        # Scope tools to what this message plausibly needs
+        tools = select_tools(user_message, TOOLS) if TOOL_SCOPING else TOOLS
+        tracker = ActionTracker()
 
-        while self.step_count < MAX_AGENT_STEPS:
-            self.step_count += 1
-            response = self.chat.history[-1]
+        for step in range(MAX_AGENT_STEPS):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.history,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=2000,
+            )
+            msg = response.choices[0].message
 
-            # Check if the model made function calls
-            if not response.parts:
-                break
+            if not msg.tool_calls:
+                self.history.append({"role": "assistant", "content": msg.content or ""})
+                return review_reply(tracker, msg.content or "(No response)")
 
-            # Check for function calls in the response
-            has_function_calls = False
-            for part in response.parts:
-                if hasattr(part, "function_call") and part.function_call:
-                    has_function_calls = True
-                    fc = part.function_call
-                    tool_name = fc.name
-                    tool_args = dict(fc.args) if fc.args else {}
+            # Record the assistant's tool-call turn
+            self.history.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
 
-                    # Show what the agent is doing
-                    args_str = json.dumps(tool_args, default=str)[:100]
-                    if len(json.dumps(tool_args, default=str)) > 100:
-                        args_str += "..."
-                    print(f"  [{self.step_count}] {tool_name}({args_str})")
+            # Execute each tool call and feed results back
+            for tc in msg.tool_calls:
+                tool_name = tc.function.name
+                try:
+                    tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError:
+                    tool_args = {}
 
-                    # Execute the tool
-                    result = execute_tool(tool_name, tool_args)
+                if verbose:
+                    args_str = json.dumps(tool_args, default=str)
+                    print(f"  [{step + 1}] {tool_name}({args_str[:100]}{'...' if len(args_str) > 100 else ''})")
 
-                    # Truncate long results for display
-                    display_result = result[:200] + "..." if len(result) > 200 else result
-                    print(f"     -> {display_result}")
+                result = dispatch_tool(tool_name, tool_args)
+                tracker.record(tool_name, tool_args, str(result))
 
-                    # Send the tool result back to the model
-                    try:
-                        self.chat.send_message(
-                            genai.protos.Part(
-                                function_response=genai.protos.FunctionResponse(
-                                    name=tool_name,
-                                    response={"result": result}
-                                )
-                            )
-                        )
-                    except Exception as e:
-                        return f"Error processing tool result: {str(e)}"
+                if verbose:
+                    print(f"     -> {result[:200]}{'...' if len(result) > 200 else ''}")
 
-            if not has_function_calls:
-                break
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result)[:4000],
+                })
 
-        # Extract final text response
-        final_response = ""
-        for part in self.chat.history[-1].parts:
-            if hasattr(part, "text") and part.text:
-                final_response += part.text
-
-        if not final_response:
-            final_response = "(Agent completed without a final text response)"
-
-        return final_response
+        return "(Max steps reached)"
 
 
 # ============================================================
@@ -146,17 +142,17 @@ class Agent:
 
 def print_banner():
     print("=" * 50)
-    print("  Gemini AI Agent - Free-tier with tool-calling")
+    print("  CLI Agent - Grok (xAI) + tool registry")
     print("=" * 50)
-    print(f"  Model: {GEMINI_MODEL}")
+    print(f"  Model: {XAI_MODEL if XAI_API_KEY else MISTRAL_MODEL}")
     print(f"  Max steps: {MAX_AGENT_STEPS}")
-    print(f"  Type 'quit' or 'exit' to stop.\n")
+    print("  Type 'quit' or 'exit' to stop.\n")
 
 
 def interactive_mode():
     """Run the agent in interactive chat mode."""
     print_banner()
-    agent = Agent()
+    agent = CLIAgent()
 
     print("Agent ready! Ask me anything.\n")
 
@@ -182,14 +178,13 @@ def interactive_mode():
 def single_task_mode(task: str):
     """Run a single task and print the result."""
     print(f"Running: {task}\n")
-    agent = Agent()
+    agent = CLIAgent()
     response = agent.run(task)
     print(f"\nResult:\n{response}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:])
-        single_task_mode(task)
+        single_task_mode(" ".join(sys.argv[1:]))
     else:
         interactive_mode()

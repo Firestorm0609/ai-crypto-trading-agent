@@ -16,7 +16,9 @@ WALLETS_DIR = Path(__file__).parent / "wallets"
 WALLETS_DIR.mkdir(exist_ok=True)
 
 SOLANA_WALLET_FILE = WALLETS_DIR / "solana_wallet.json"
-SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+from evm_swap import solana_rpc
+
+SOLANA_RPC = solana_rpc()          # Helius -> Alchemy -> public (best available)
 
 
 def _load_solana_wallet() -> dict:
@@ -98,7 +100,7 @@ def execute_swap(token_in: str, token_out: str, amount: float, slippage: int = 5
             "slippageBps": str(slippage),
             "userPublicKey": pubkey,
         }
-        url = "https://quote-api.jup.ag/v6/quote?" + "&".join(f"{k}={v}" for k, v in params.items())
+        url = "https://lite-api.jup.ag/swap/v1/quote?" + "&".join(f"{k}={v}" for k, v in params.items())
         req = urllib.request.Request(url, headers={"User-Agent": "TradingAgent/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             quote = json.loads(resp.read().decode())
@@ -116,7 +118,7 @@ def execute_swap(token_in: str, token_out: str, amount: float, slippage: int = 5
         })
 
         swap_req = urllib.request.Request(
-            "https://quote-api.jup.ag/v6/swap",
+            "https://lite-api.jup.ag/swap/v1/swap",
             data=swap_body.encode(),
             headers={"Content-Type": "application/json", "User-Agent": "TradingAgent/1.0"},
             method="POST"
@@ -231,13 +233,15 @@ def sell_token(token: str, percentage: float = 100) -> str:
 # ============================================================
 
 SWAP_TOOLS = [
-    {"type": "function", "function": {"name": "jupiter_buy", "description": "Buy a Solana token with SOL on Jupiter. Real swap execution.", "parameters": {"type": "object", "properties": {"token": {"type": "string", "description": "Token symbol or mint address"}, "amount_sol": {"type": "number", "description": "Amount of SOL to spend"}}, "required": ["token", "amount_sol"]}}},
+    {"type": "function", "function": {"name": "jupiter_buy", "description": "Buy a Solana token on Jupiter. Real swap execution. When the user states a size in DOLLARS (e.g. '$20 of WIF'), pass usd_amount — converted at the live SOL rate. Only pass amount_sol when the user is explicit about SOL.", "parameters": {"type": "object", "properties": {"token": {"type": "string", "description": "Token symbol or mint address"}, "usd_amount": {"type": "number", "description": "Size in US dollars — PREFERRED when the user said '$X'"}, "amount_sol": {"type": "number", "description": "Amount of SOL (only when user is explicit about SOL)"}}, "required": ["token"]}}},
     {"type": "function", "function": {"name": "jupiter_sell", "description": "Sell a Solana token for SOL on Jupiter. Real swap execution.", "parameters": {"type": "object", "properties": {"token": {"type": "string", "description": "Token symbol or mint address"}, "percentage": {"type": "number", "description": "Percentage to sell (default 100)"}}, "required": ["token"]}}},
     {"type": "function", "function": {"name": "check_sol_balance", "description": "Check SOL balance in the Solana wallet.", "parameters": {"type": "object", "properties": {}}}},
 ]
 
 SWAP_TOOL_MAP = {
-    "jupiter_buy": lambda a: buy_token(a["token"], float(a["amount_sol"])),
+    "jupiter_buy": lambda a: buy_token(
+        a["token"], float(a.get("amount_sol", 0) or 0),
+        usd_amount=(float(a["usd_amount"]) if a.get("usd_amount") is not None else None)),
     "jupiter_sell": lambda a: sell_token(a["token"], float(a.get("percentage", 100))),
     "check_sol_balance": lambda a: _check_balance(),
 }
